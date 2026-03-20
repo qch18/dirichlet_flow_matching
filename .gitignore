@@ -10,3 +10,4 @@ wheels/
 .venv
 
 third_party/
+data/
