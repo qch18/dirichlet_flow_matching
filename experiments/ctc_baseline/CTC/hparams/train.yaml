@@ -13,7 +13,7 @@ save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
 # Data files
-data_folder: E:\dfm_asr\data\TIMIT # Path to TIMIT
+data_folder: "E:/dfm_asr/data/TIMIT/data" # Path to TIMIT
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
@@ -26,7 +26,7 @@ NOISE_DATASET_URL: https://www.dropbox.com/scl/fi/a09pj97s5ifan81dqhi4n/noises.z
 noise_annotation: !ref <save_folder>/noise.csv #The data manifest files are created by the data preparation script
 
 ####################### Training Parameters ####################################
-number_of_epochs: 50
+number_of_epochs: 11
 batch_size: 8
 lr: 1.0
 sorting: ascending # choose between ascending, descending and random
@@ -53,7 +53,7 @@ output_neurons: 40
 blank_index: 0
 
 # Dataloader options
-num_workers: 4
+num_workers: 0
 train_dataloader_opts:
     batch_size: !ref <batch_size>
     num_workers: !ref <num_workers>

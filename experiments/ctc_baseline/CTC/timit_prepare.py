@@ -399,14 +399,24 @@ def create_json(wav_lst, json_file, uppercase, phn_set):
         signal = read_audio(wav_file)
         duration = len(signal) / SAMPLERATE
 
-        # Retrieving words and check for uppercase
-        if uppercase:
-            wrd_file = wav_file.replace(".WAV", ".WRD")
-        else:
-            wrd_file = wav_file.replace(".wav", ".wrd")
+        # Build companion label-file paths from the final extension only.
+        # This is robust to filenames such as SI1027.WAV.wav or SI1027.WAV.WAV.
+        root, ext = os.path.splitext(wav_file)
+        if ext.lower() == ".wav":
+            root2, ext2 = os.path.splitext(root)
+            if ext2.lower() == ".wav":
+                root = root2
+                ext = ext2
 
-        if not os.path.exists(os.path.dirname(wrd_file)):
-            err_msg = "the wrd file %s does not exists!" % (wrd_file)
+        if uppercase:
+            wrd_file = root + ".WRD"
+            phn_file = root + ".PHN"
+        else:
+            wrd_file = root + ".wrd"
+            phn_file = root + ".phn"
+
+        if not os.path.isfile(wrd_file):
+            err_msg = "the wrd file %s does not exist!" % (wrd_file)
             raise FileNotFoundError(err_msg)
 
         words = [
@@ -415,14 +425,8 @@ def create_json(wav_lst, json_file, uppercase, phn_set):
         ]
         words = " ".join(words)
 
-        # Retrieving phonemes
-        if uppercase:
-            phn_file = wav_file.replace(".WAV", ".PHN")
-        else:
-            phn_file = wav_file.replace(".wav", ".phn")
-
-        if not os.path.exists(os.path.dirname(phn_file)):
-            err_msg = "the wrd file %s does not exists!" % (phn_file)
+        if not os.path.isfile(phn_file):
+            err_msg = "the phn file %s does not exist!" % (phn_file)
             raise FileNotFoundError(err_msg)
 
         # Getting the phoneme and ground truth ends lists from the phn files
