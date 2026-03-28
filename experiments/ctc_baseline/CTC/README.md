@@ -55,3 +55,4 @@ Please, cite SpeechBrain if you use it for your research or business.
 }
 ```
 
+python train.py hparams/train.yaml --data_folder=data/TIMIT --jit
