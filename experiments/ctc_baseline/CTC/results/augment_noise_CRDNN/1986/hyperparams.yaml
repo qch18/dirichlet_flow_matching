@@ -1,4 +1,4 @@
-# Generated 2026-03-27 from:
+# Generated 2026-03-30 from:
 # E:\dfm_asr\experiments\ctc_baseline\CTC\hparams\train.yaml
 # yamllint disable
 # ################################
@@ -16,7 +16,7 @@ save_folder: results/augment_noise_CRDNN/1986/save
 train_log: results/augment_noise_CRDNN/1986/train_log.txt
 
 # Data files
-data_folder: E:/dfm_asr/data/TIMIT/data   # Path to TIMIT
+data_folder: data/TIMIT                   # Path to TIMIT
 train_annotation: results/augment_noise_CRDNN/1986/save/train.json
 valid_annotation: results/augment_noise_CRDNN/1986/save/dev.json
 test_annotation: results/augment_noise_CRDNN/1986/save/test.json
@@ -24,13 +24,13 @@ skip_prep: false # Skip data preparation
 uppercase: true # Must be True when the TIMIT dataset is in the upper-case version
 
 # Data for augmentation
-data_folder_noise: E:/dfm_asr/data/TIMIT/data/noise # The noisy sequences for data augmentation will automatically be downloaded here.
+data_folder_noise: data/TIMIT/noise         # The noisy sequences for data augmentation will automatically be downloaded here.
 NOISE_DATASET_URL: 
   https://www.dropbox.com/scl/fi/a09pj97s5ifan81dqhi4n/noises.zip?rlkey=j8b0n9kdjdr32o1f06t0cw5b7&dl=1
 noise_annotation: results/augment_noise_CRDNN/1986/save/noise.csv #The data manifest files are created by the data preparation script
 
 ####################### Training Parameters ####################################
-number_of_epochs: 11
+number_of_epochs: 50
 batch_size: 8
 lr: 1.0
 sorting: ascending # choose between ascending, descending and random
@@ -80,7 +80,7 @@ normalize: &id010 !new:speechbrain.processing.features.InputNormalization
 prepare_noise_data: !name:speechbrain.augment.preparation.prepare_dataset_from_URL
   URL: 
     https://www.dropbox.com/scl/fi/a09pj97s5ifan81dqhi4n/noises.zip?rlkey=j8b0n9kdjdr32o1f06t0cw5b7&dl=1
-  dest_folder: E:/dfm_asr/data/TIMIT/data/noise
+  dest_folder: data/TIMIT/noise
   ext: wav
   csv_file: results/augment_noise_CRDNN/1986/save/noise.csv
 
@@ -125,7 +125,7 @@ wav_augment: !new:speechbrain.augment.augmenter.Augmenter
 
 epoch_counter: &id012 !new:speechbrain.utils.epoch_loop.EpochCounter
 
-  limit: 11
+  limit: 50
 
 compute_features: !new:speechbrain.lobes.features.Fbank
   sample_rate: 16000
