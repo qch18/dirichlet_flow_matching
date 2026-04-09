@@ -1,11 +1,12 @@
 # ################################
-# Model: DFM + CTC ASR on TIMIT with CRDNN
-# First DFM prototype:
+# Model: DFM v2 + CTC ASR on TIMIT with CRDNN
+# Hybrid objective:
 #   features -> encoder -> logits -> DFM -> log-probs -> CTC
+# plus explicit flow-matching loss on simplex bridge states
 # ################################
 
 seed: 1986
-run_name: dfm_ver1
+run_name: dfm_v2
 output_folder: !ref results/dfm_tests/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -20,8 +21,7 @@ train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
 
-# Set to False for the first run in a new experiment folder
-# so train/dev/test json files are created in this save folder.
+# For a brand new run_name folder, keep this False once so json files are created.
 skip_prep: False
 uppercase: True
 
@@ -73,7 +73,14 @@ blank_index: 0
 dfm_hidden: 256
 dfm_num_flow_steps: 4
 dfm_epsilon: 1.0e-6
-dfm_reg_weight: 0.05
+
+# ----------------------------------------------------------------------
+# Hybrid loss parameters
+# ----------------------------------------------------------------------
+target_smoothing: 0.02
+lambda_ctc: 1.0
+lambda_fm: 0.5
+lambda_reg: 0.05
 
 # ----------------------------------------------------------------------
 # Dataloader options
@@ -180,7 +187,7 @@ output: !new:speechbrain.nnet.linear.Linear
 
 # ----------------------------------------------------------------------
 # DFM block
-# This expects a DFMModule class defined in train.py
+# Expects DFMModule to be defined in train.py
 # ----------------------------------------------------------------------
 dfm: !new:__main__.DFMModule
     vocab_size: !ref <output_neurons>
