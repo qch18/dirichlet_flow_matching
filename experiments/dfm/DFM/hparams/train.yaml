@@ -1,12 +1,12 @@
 # ################################
-# Model: DFM v2 + CTC ASR on TIMIT with CRDNN
+# Model: DFM v3 + CTC ASR on TIMIT with CRDNN
 # Hybrid objective:
 #   features -> encoder -> logits -> DFM -> log-probs -> CTC
-# plus explicit flow-matching loss on simplex bridge states
+# plus explicit flow-matching loss on a Dirichlet bridge
 # ################################
 
 seed: 1986
-run_name: dfm_v2
+run_name: dfm_v3
 output_folder: !ref results/dfm_tests/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -21,7 +21,7 @@ train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
 
-# For a brand new run_name folder, keep this False once so json files are created.
+# New run_name => new save folder, so keep this False for the first run.
 skip_prep: False
 uppercase: True
 
@@ -73,6 +73,10 @@ blank_index: 0
 dfm_hidden: 256
 dfm_num_flow_steps: 4
 dfm_epsilon: 1.0e-6
+
+# Dirichlet bridge parameters
+dirichlet_target_scale: 20.0
+dirichlet_bridge_temperature: 1.0
 
 # ----------------------------------------------------------------------
 # Hybrid loss parameters
@@ -179,7 +183,6 @@ model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     dnn_blocks: !ref <dnn_blocks>
     dnn_neurons: !ref <dnn_neurons>
 
-# Linear projection to vocabulary logits
 output: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <dnn_neurons>
     n_neurons: !ref <output_neurons>
@@ -187,7 +190,6 @@ output: !new:speechbrain.nnet.linear.Linear
 
 # ----------------------------------------------------------------------
 # DFM block
-# Expects DFMModule to be defined in train.py
 # ----------------------------------------------------------------------
 dfm: !new:__main__.DFMModule
     vocab_size: !ref <output_neurons>
@@ -195,6 +197,8 @@ dfm: !new:__main__.DFMModule
     dfm_hidden: !ref <dfm_hidden>
     num_flow_steps: !ref <dfm_num_flow_steps>
     epsilon: !ref <dfm_epsilon>
+    target_scale: !ref <dirichlet_target_scale>
+    bridge_temperature: !ref <dirichlet_bridge_temperature>
 
 log_softmax: !new:speechbrain.nnet.activations.Softmax
     apply_log: True

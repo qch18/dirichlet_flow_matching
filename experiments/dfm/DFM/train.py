@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Recipe for training a phoneme recognizer on TIMIT.
 
-DFM v2:
+DFM v3:
 - encoder -> logits -> DFM -> log-probs -> CTC
-- explicit flow-matching loss on bridge states
+- explicit flow-matching loss on Dirichlet bridge states
+- monitoring for loss components, simplex sanity, entropy, and DFM activity
 """
 
+import math
 import os
 import sys
 
@@ -30,6 +32,8 @@ class DFMModule(nn.Module):
         dfm_hidden=256,
         num_flow_steps=4,
         epsilon=1e-6,
+        target_scale=20.0,
+        bridge_temperature=1.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -37,6 +41,8 @@ class DFMModule(nn.Module):
         self.dfm_hidden = dfm_hidden
         self.num_flow_steps = num_flow_steps
         self.epsilon = epsilon
+        self.target_scale = target_scale
+        self.bridge_temperature = bridge_temperature
 
         self.velocity_net = nn.Sequential(
             nn.Linear(vocab_size + hidden_size + 1, dfm_hidden),
@@ -56,6 +62,11 @@ class DFMModule(nn.Module):
         x = x.clamp_min(self.epsilon)
         return x / x.sum(dim=-1, keepdim=True).clamp_min(self.epsilon)
 
+    def simplex_to_dirichlet(self, p, scale=None):
+        if scale is None:
+            scale = self.target_scale
+        return scale * p.clamp_min(self.epsilon) + self.epsilon
+
     def velocity(self, p, t, h):
         t_tensor = torch.full(
             (p.size(0), p.size(1), 1),
@@ -68,9 +79,15 @@ class DFMModule(nn.Module):
         v = v - v.mean(dim=-1, keepdim=True)
         return v
 
-    def sample_bridge(self, p0, p1, t):
-        xt = (1.0 - t) * p0 + t * p1
-        return self.project_to_simplex(xt)
+    def sample_dirichlet_bridge(self, alpha0, p1, t):
+        alpha1 = self.simplex_to_dirichlet(p1, self.target_scale)
+        alpha_t = (1.0 - t) * alpha0 + t * alpha1
+
+        if self.bridge_temperature != 1.0:
+            alpha_t = alpha_t.pow(self.bridge_temperature)
+
+        x_t = self.dirichlet_mean(alpha_t)
+        return self.project_to_simplex(x_t), alpha1, alpha_t
 
     def integrate(self, p_init, hidden_states):
         p = p_init
@@ -119,9 +136,7 @@ class ASR_Brain(sb.Brain):
                 start_frame = max(0, min(T_enc - 1, start_frame))
                 end_frame = max(start_frame + 1, min(T_enc, end_frame))
 
-                phon_id = int(
-                    self.label_encoder.encode_sequence_torch([phon])[0].item()
-                )
+                phon_id = int(self.label_encoder.encode_sequence_torch([phon])[0].item())
 
                 frame_ids[b, start_frame:end_frame] = phon_id
                 frame_mask[b, start_frame:end_frame] = 1.0
@@ -136,6 +151,95 @@ class ASR_Brain(sb.Brain):
         smooth = self.hparams.target_smoothing
         y = (1.0 - smooth) * y + smooth / self.hparams.output_neurons
         return y
+
+    def compute_entropy(self, probs):
+        probs = probs.clamp_min(1e-8)
+        ent = -(probs * probs.log()).sum(dim=-1)
+        return ent.mean()
+
+    def _init_monitor_sums(self):
+        self.monitor_sums = {
+            "ctc_loss": 0.0,
+            "fm_loss": 0.0,
+            "reg_loss": 0.0,
+            "flow_delta": 0.0,
+            "p0_row_sum_mean": 0.0,
+            "xt_row_sum_mean": 0.0,
+            "final_row_sum_mean": 0.0,
+            "final_min": 0.0,
+            "t_value": 0.0,
+            "dfm_grad_norm": 0.0,
+            "p0_entropy": 0.0,
+            "xt_entropy": 0.0,
+            "final_entropy": 0.0,
+            "num_batches": 0,
+        }
+
+    def _update_monitor_sums(
+        self,
+        ctc_loss,
+        fm_loss,
+        reg_loss,
+        p0,
+        xt,
+        final_probs,
+        t_value,
+        dfm_grad_norm=None,
+    ):
+        self.monitor_sums["ctc_loss"] += float(ctc_loss.detach().cpu())
+        self.monitor_sums["fm_loss"] += float(fm_loss.detach().cpu())
+        self.monitor_sums["reg_loss"] += float(reg_loss.detach().cpu())
+        self.monitor_sums["flow_delta"] += float(
+            (final_probs - p0).abs().mean().detach().cpu()
+        )
+        self.monitor_sums["p0_row_sum_mean"] += float(
+            p0.sum(dim=-1).mean().detach().cpu()
+        )
+        self.monitor_sums["xt_row_sum_mean"] += float(
+            xt.sum(dim=-1).mean().detach().cpu()
+        )
+        self.monitor_sums["final_row_sum_mean"] += float(
+            final_probs.sum(dim=-1).mean().detach().cpu()
+        )
+        self.monitor_sums["final_min"] += float(final_probs.min().detach().cpu())
+        self.monitor_sums["t_value"] += float(t_value)
+        self.monitor_sums["p0_entropy"] += float(self.compute_entropy(p0).detach().cpu())
+        self.monitor_sums["xt_entropy"] += float(self.compute_entropy(xt).detach().cpu())
+        self.monitor_sums["final_entropy"] += float(
+            self.compute_entropy(final_probs).detach().cpu()
+        )
+        if dfm_grad_norm is not None:
+            self.monitor_sums["dfm_grad_norm"] += float(dfm_grad_norm)
+        self.monitor_sums["num_batches"] += 1
+
+    def _get_monitor_averages(self):
+        n = max(self.monitor_sums["num_batches"], 1)
+        return {
+            "ctc_loss": self.monitor_sums["ctc_loss"] / n,
+            "fm_loss": self.monitor_sums["fm_loss"] / n,
+            "reg_loss": self.monitor_sums["reg_loss"] / n,
+            "flow_delta": self.monitor_sums["flow_delta"] / n,
+            "p0_row_sum_mean": self.monitor_sums["p0_row_sum_mean"] / n,
+            "xt_row_sum_mean": self.monitor_sums["xt_row_sum_mean"] / n,
+            "final_row_sum_mean": self.monitor_sums["final_row_sum_mean"] / n,
+            "final_min": self.monitor_sums["final_min"] / n,
+            "t_value": self.monitor_sums["t_value"] / n,
+            "dfm_grad_norm": self.monitor_sums["dfm_grad_norm"] / n,
+            "p0_entropy": self.monitor_sums["p0_entropy"] / n,
+            "xt_entropy": self.monitor_sums["xt_entropy"] / n,
+            "final_entropy": self.monitor_sums["final_entropy"] / n,
+        }
+
+    def _get_dfm_grad_norm(self):
+        total = 0.0
+        found = False
+        for p in self.modules.dfm.parameters():
+            if p.grad is not None:
+                total += float(p.grad.detach().norm().cpu()) ** 2
+                found = True
+        if not found:
+            return None
+        return math.sqrt(total)
 
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
@@ -167,6 +271,7 @@ class ASR_Brain(sb.Brain):
         log_probs = predictions["log_probs"]
         pout_lens = predictions["wav_lens"]
         hidden = predictions["hidden"]
+        alpha0 = predictions["alpha0"]
         p0 = predictions["p0"]
         final_probs = predictions["final_probs"]
 
@@ -182,9 +287,11 @@ class ASR_Brain(sb.Brain):
         p1 = self.make_target_simplex(frame_ids)
 
         t = torch.rand(1, device=hidden.device).item()
-        xt = self.modules.dfm.sample_bridge(p0, p1, t)
+        xt, alpha1, alpha_t = self.modules.dfm.sample_dirichlet_bridge(alpha0, p1, t)
 
         v_pred = self.modules.dfm.velocity(xt, t, hidden)
+
+        # v3 still uses a practical target velocity for stability
         v_target = p1 - p0
 
         fm_sq = (v_pred - v_target) ** 2
@@ -198,6 +305,16 @@ class ASR_Brain(sb.Brain):
             + self.hparams.lambda_fm * fm_loss
             + self.hparams.lambda_reg * reg_loss
         )
+
+        self.current_batch_stats = {
+            "ctc_loss": ctc_loss.detach(),
+            "fm_loss": fm_loss.detach(),
+            "reg_loss": reg_loss.detach(),
+            "p0": p0.detach(),
+            "xt": xt.detach(),
+            "final_probs": final_probs.detach(),
+            "t": t,
+        }
 
         self.ctc_metrics.append(batch.id, log_probs, phns, pout_lens, phn_lens)
 
@@ -213,28 +330,103 @@ class ASR_Brain(sb.Brain):
                 ind2lab=self.label_encoder.decode_ndim,
             )
 
+            self._update_monitor_sums(
+                ctc_loss=ctc_loss,
+                fm_loss=fm_loss,
+                reg_loss=reg_loss,
+                p0=p0,
+                xt=xt,
+                final_probs=final_probs,
+                t_value=t,
+                dfm_grad_norm=None,
+            )
+
         return loss
+
+    def fit_batch(self, batch):
+        outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        dfm_grad_norm = self._get_dfm_grad_norm()
+        self._update_monitor_sums(
+            ctc_loss=self.current_batch_stats["ctc_loss"],
+            fm_loss=self.current_batch_stats["fm_loss"],
+            reg_loss=self.current_batch_stats["reg_loss"],
+            p0=self.current_batch_stats["p0"],
+            xt=self.current_batch_stats["xt"],
+            final_probs=self.current_batch_stats["final_probs"],
+            t_value=self.current_batch_stats["t"],
+            dfm_grad_norm=dfm_grad_norm,
+        )
+
+        self.optimizer.step()
+        return loss.detach()
+
+    def evaluate_batch(self, batch, stage):
+        with torch.no_grad():
+            outputs = self.compute_forward(batch, stage=stage)
+            loss = self.compute_objectives(outputs, batch, stage=stage)
+        return loss.detach()
 
     def on_stage_start(self, stage, epoch):
         self.ctc_metrics = self.hparams.ctc_stats()
+        self._init_monitor_sums()
 
         if stage != sb.Stage.TRAIN:
             self.per_metrics = self.hparams.per_stats()
 
     def on_stage_end(self, stage, stage_loss, epoch):
+        monitor_stats = self._get_monitor_averages()
+
         if stage == sb.Stage.TRAIN:
             self.train_loss = stage_loss
+            self.train_monitor_stats = monitor_stats
         else:
             per = self.per_metrics.summarize("error_rate")
 
         if stage == sb.Stage.VALID:
             old_lr, new_lr = self.hparams.lr_annealing(per)
             sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
+
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": old_lr},
-                train_stats={"loss": self.train_loss},
-                valid_stats={"loss": stage_loss, "PER": per},
+                train_stats={
+                    "loss": self.train_loss,
+                    "ctc_loss": self.train_monitor_stats["ctc_loss"],
+                    "fm_loss": self.train_monitor_stats["fm_loss"],
+                    "reg_loss": self.train_monitor_stats["reg_loss"],
+                    "flow_delta": self.train_monitor_stats["flow_delta"],
+                    "p0_row_sum_mean": self.train_monitor_stats["p0_row_sum_mean"],
+                    "xt_row_sum_mean": self.train_monitor_stats["xt_row_sum_mean"],
+                    "final_row_sum_mean": self.train_monitor_stats["final_row_sum_mean"],
+                    "final_min": self.train_monitor_stats["final_min"],
+                    "t_mean": self.train_monitor_stats["t_value"],
+                    "dfm_grad_norm": self.train_monitor_stats["dfm_grad_norm"],
+                    "p0_entropy": self.train_monitor_stats["p0_entropy"],
+                    "xt_entropy": self.train_monitor_stats["xt_entropy"],
+                    "final_entropy": self.train_monitor_stats["final_entropy"],
+                },
+                valid_stats={
+                    "loss": stage_loss,
+                    "PER": per,
+                    "ctc_loss": monitor_stats["ctc_loss"],
+                    "fm_loss": monitor_stats["fm_loss"],
+                    "reg_loss": monitor_stats["reg_loss"],
+                    "flow_delta": monitor_stats["flow_delta"],
+                    "p0_row_sum_mean": monitor_stats["p0_row_sum_mean"],
+                    "xt_row_sum_mean": monitor_stats["xt_row_sum_mean"],
+                    "final_row_sum_mean": monitor_stats["final_row_sum_mean"],
+                    "final_min": monitor_stats["final_min"],
+                    "t_mean": monitor_stats["t_value"],
+                    "p0_entropy": monitor_stats["p0_entropy"],
+                    "xt_entropy": monitor_stats["xt_entropy"],
+                    "final_entropy": monitor_stats["final_entropy"],
+                },
             )
+
             self.checkpointer.save_and_keep_only(
                 meta={"PER": per},
                 min_keys=["PER"],
@@ -243,7 +435,22 @@ class ASR_Brain(sb.Brain):
         elif stage == sb.Stage.TEST:
             self.hparams.train_logger.log_stats(
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats={"loss": stage_loss, "PER": per},
+                test_stats={
+                    "loss": stage_loss,
+                    "PER": per,
+                    "ctc_loss": monitor_stats["ctc_loss"],
+                    "fm_loss": monitor_stats["fm_loss"],
+                    "reg_loss": monitor_stats["reg_loss"],
+                    "flow_delta": monitor_stats["flow_delta"],
+                    "p0_row_sum_mean": monitor_stats["p0_row_sum_mean"],
+                    "xt_row_sum_mean": monitor_stats["xt_row_sum_mean"],
+                    "final_row_sum_mean": monitor_stats["final_row_sum_mean"],
+                    "final_min": monitor_stats["final_min"],
+                    "t_mean": monitor_stats["t_value"],
+                    "p0_entropy": monitor_stats["p0_entropy"],
+                    "xt_entropy": monitor_stats["xt_entropy"],
+                    "final_entropy": monitor_stats["final_entropy"],
+                },
             )
             if if_main_process():
                 with open(self.hparams.test_wer_file, "w", encoding="utf-8") as w:
