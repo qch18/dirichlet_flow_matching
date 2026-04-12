@@ -7,7 +7,7 @@
 # ################################
 
 seed: 1986
-run_name: dfm_stage2_dirichlet_init
+run_name: dfm_stage3_align
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -56,6 +56,9 @@ blank_index: 0
 
 # Stage 2 DFM parameter
 dfm_epsilon: 1.0e-6
+
+#  Stage 3 DFM parameter 
+target_smoothing: 0.02
 
 # Dataloader options
 num_workers: 0

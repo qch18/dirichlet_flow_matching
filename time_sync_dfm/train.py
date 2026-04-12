@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Stage 2: baseline CTC ASR on TIMIT with Dirichlet parameterisation.
+"""Stage 3: CTC ASR on TIMIT with Dirichlet initialization + frame-aligned target p1.
 
-This stage adds:
-- Dirichlet parameters A = softplus(logits) + eps
-- initial simplex state p0 = A / sum(A)
+Adds:
+- A = softplus(logits) + eps
+- p0 = A / sum(A)
+- p1 = AlignToFrames(y, H)
 
 Still NO bridge, NO velocity net, NO FM loss yet.
-Training is still plain CTC, but now through p0.
+Training remains plain CTC on p0.
 """
 
 import os
@@ -32,6 +33,62 @@ class ASR_Brain(sb.Brain):
             self.hparams.dfm_epsilon
         )
 
+    def build_frame_targets(self, batch, hidden, wav_lens):
+        """
+        Approximates AlignToFrames(y, H) using TIMIT phoneme end boundaries.
+        Returns:
+            frame_ids: [B, T_enc] long
+            frame_mask: [B, T_enc] float
+        """
+        device = hidden.device
+        B, T_enc = hidden.size(0), hidden.size(1)
+
+        frame_ids = torch.full(
+            (B, T_enc),
+            fill_value=self.hparams.blank_index,
+            dtype=torch.long,
+            device=device,
+        )
+        frame_mask = torch.zeros((B, T_enc), dtype=torch.float32, device=device)
+
+        max_wav_len = batch.sig[0].size(1)
+
+        for b in range(B):
+            valid_samples = int(round(float(wav_lens[b].detach().cpu()) * max_wav_len))
+            valid_samples = max(valid_samples, 1)
+
+            phns = batch.phn_list[b]
+            ends = batch.phn_end_list[b]
+
+            prev_end = 0
+            for phon, end_sample in zip(phns, ends):
+                start_frame = int(round((prev_end / valid_samples) * T_enc))
+                end_frame = int(round((end_sample / valid_samples) * T_enc))
+
+                start_frame = max(0, min(T_enc - 1, start_frame))
+                end_frame = max(start_frame + 1, min(T_enc, end_frame))
+
+                phon_id = int(
+                    self.label_encoder.encode_sequence_torch([phon])[0].item()
+                )
+
+                frame_ids[b, start_frame:end_frame] = phon_id
+                frame_mask[b, start_frame:end_frame] = 1.0
+                prev_end = end_sample
+
+        return frame_ids, frame_mask
+
+    def make_target_simplex(self, frame_ids):
+        """
+        Builds p1 as a smoothed one-hot framewise target distribution.
+        """
+        p1 = F.one_hot(
+            frame_ids, num_classes=self.hparams.output_neurons
+        ).float()
+        smooth = self.hparams.target_smoothing
+        p1 = (1.0 - smooth) * p1 + smooth / self.hparams.output_neurons
+        return p1
+
     def _init_monitor_sums(self):
         self.monitor_sums = {
             "ctc_loss": 0.0,
@@ -43,6 +100,9 @@ class ASR_Brain(sb.Brain):
             "p0_entropy": 0.0,
             "p0_row_sum_mean": 0.0,
             "p0_min": 0.0,
+            "p1_entropy": 0.0,
+            "p1_row_sum_mean": 0.0,
+            "p1_min": 0.0,
             "blank_prob_mean": 0.0,
             "max_prob_mean": 0.0,
             "num_batches": 0,
@@ -54,11 +114,13 @@ class ASR_Brain(sb.Brain):
         logits,
         alpha,
         p0,
+        p1,
         log_probs,
         grad_norm=None,
     ):
         probs = log_probs.exp()
         p0_entropy = -(p0 * p0.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        p1_entropy = -(p1 * p1.clamp_min(1e-8).log()).sum(dim=-1).mean()
         blank_prob_mean = probs[..., self.hparams.blank_index].mean()
         max_prob_mean = probs.max(dim=-1).values.mean()
 
@@ -72,6 +134,13 @@ class ASR_Brain(sb.Brain):
             p0.sum(dim=-1).mean().detach().cpu()
         )
         self.monitor_sums["p0_min"] += float(p0.min().detach().cpu())
+
+        self.monitor_sums["p1_entropy"] += float(p1_entropy.detach().cpu())
+        self.monitor_sums["p1_row_sum_mean"] += float(
+            p1.sum(dim=-1).mean().detach().cpu()
+        )
+        self.monitor_sums["p1_min"] += float(p1.min().detach().cpu())
+
         self.monitor_sums["blank_prob_mean"] += float(blank_prob_mean.detach().cpu())
         self.monitor_sums["max_prob_mean"] += float(max_prob_mean.detach().cpu())
 
@@ -92,6 +161,9 @@ class ASR_Brain(sb.Brain):
             "p0_entropy": self.monitor_sums["p0_entropy"] / n,
             "p0_row_sum_mean": self.monitor_sums["p0_row_sum_mean"] / n,
             "p0_min": self.monitor_sums["p0_min"] / n,
+            "p1_entropy": self.monitor_sums["p1_entropy"] / n,
+            "p1_row_sum_mean": self.monitor_sums["p1_row_sum_mean"] / n,
+            "p1_min": self.monitor_sums["p1_min"] / n,
             "blank_prob_mean": self.monitor_sums["blank_prob_mean"] / n,
             "max_prob_mean": self.monitor_sums["max_prob_mean"] / n,
         }
@@ -108,7 +180,7 @@ class ASR_Brain(sb.Brain):
         return total ** 0.5
 
     def compute_forward(self, batch, stage):
-        "Computes hidden states, logits, Dirichlet params, and simplex state p0."
+        "Computes hidden states, logits, Dirichlet params, p0, and frame target p1."
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
 
@@ -121,14 +193,21 @@ class ASR_Brain(sb.Brain):
         hidden = self.modules.model(feats)           # H
         logits = self.modules.output(hidden)         # Z
         alpha = self.logits_to_dirichlet(logits)     # A
-        p0 = self.dirichlet_mean(alpha)              # initial simplex state
-        log_probs = torch.log(p0.clamp_min(1e-8))    # CTC now uses p0
+        p0 = self.dirichlet_mean(alpha)              # start state
+
+        frame_ids, frame_mask = self.build_frame_targets(batch, hidden, wav_lens)
+        p1 = self.make_target_simplex(frame_ids)     # target endpoint
+
+        log_probs = torch.log(p0.clamp_min(1e-8))    # still plain CTC on p0
 
         return {
             "hidden": hidden,
             "logits": logits,
             "alpha": alpha,
             "p0": p0,
+            "p1": p1,
+            "frame_ids": frame_ids,
+            "frame_mask": frame_mask,
             "log_probs": log_probs,
             "wav_lens": wav_lens,
         }
@@ -139,6 +218,7 @@ class ASR_Brain(sb.Brain):
         logits = predictions["logits"]
         alpha = predictions["alpha"]
         p0 = predictions["p0"]
+        p1 = predictions["p1"]
         pout_lens = predictions["wav_lens"]
 
         phns, phn_lens = batch.phn_encoded
@@ -154,6 +234,7 @@ class ASR_Brain(sb.Brain):
             "logits": logits.detach(),
             "alpha": alpha.detach(),
             "p0": p0.detach(),
+            "p1": p1.detach(),
             "log_probs": log_probs.detach(),
         }
 
@@ -176,6 +257,7 @@ class ASR_Brain(sb.Brain):
                 logits=logits,
                 alpha=alpha,
                 p0=p0,
+                p1=p1,
                 log_probs=log_probs,
                 grad_norm=None,
             )
@@ -196,6 +278,7 @@ class ASR_Brain(sb.Brain):
             logits=self.current_batch_stats["logits"],
             alpha=self.current_batch_stats["alpha"],
             p0=self.current_batch_stats["p0"],
+            p1=self.current_batch_stats["p1"],
             log_probs=self.current_batch_stats["log_probs"],
             grad_norm=grad_norm,
         )
@@ -242,6 +325,9 @@ class ASR_Brain(sb.Brain):
                     "p0_entropy": self.train_monitor_stats["p0_entropy"],
                     "p0_row_sum_mean": self.train_monitor_stats["p0_row_sum_mean"],
                     "p0_min": self.train_monitor_stats["p0_min"],
+                    "p1_entropy": self.train_monitor_stats["p1_entropy"],
+                    "p1_row_sum_mean": self.train_monitor_stats["p1_row_sum_mean"],
+                    "p1_min": self.train_monitor_stats["p1_min"],
                     "blank_prob_mean": self.train_monitor_stats["blank_prob_mean"],
                     "max_prob_mean": self.train_monitor_stats["max_prob_mean"],
                 },
@@ -256,6 +342,9 @@ class ASR_Brain(sb.Brain):
                     "p0_entropy": monitor_stats["p0_entropy"],
                     "p0_row_sum_mean": monitor_stats["p0_row_sum_mean"],
                     "p0_min": monitor_stats["p0_min"],
+                    "p1_entropy": monitor_stats["p1_entropy"],
+                    "p1_row_sum_mean": monitor_stats["p1_row_sum_mean"],
+                    "p1_min": monitor_stats["p1_min"],
                     "blank_prob_mean": monitor_stats["blank_prob_mean"],
                     "max_prob_mean": monitor_stats["max_prob_mean"],
                 },
@@ -280,6 +369,9 @@ class ASR_Brain(sb.Brain):
                     "p0_entropy": monitor_stats["p0_entropy"],
                     "p0_row_sum_mean": monitor_stats["p0_row_sum_mean"],
                     "p0_min": monitor_stats["p0_min"],
+                    "p1_entropy": monitor_stats["p1_entropy"],
+                    "p1_row_sum_mean": monitor_stats["p1_row_sum_mean"],
+                    "p1_min": monitor_stats["p1_min"],
                     "blank_prob_mean": monitor_stats["blank_prob_mean"],
                     "max_prob_mean": monitor_stats["max_prob_mean"],
                 },
@@ -350,13 +442,17 @@ def dataio_prep(hparams):
 
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline)
 
-    @sb.utils.data_pipeline.takes("phn")
-    @sb.utils.data_pipeline.provides("phn_list", "phn_encoded")
-    def text_pipeline(phn):
+    @sb.utils.data_pipeline.takes("phn", "ground_truth_phn_ends")
+    @sb.utils.data_pipeline.provides("phn_list", "phn_encoded", "phn_end_list")
+    def text_pipeline(phn, ground_truth_phn_ends):
         phn_list = phn.strip().split()
         yield phn_list
+
         phn_encoded = label_encoder.encode_sequence_torch(phn_list)
         yield phn_encoded
+
+        phn_end_list = [int(x) for x in ground_truth_phn_ends.strip().split()]
+        yield phn_end_list
 
     sb.dataio.dataset.add_dynamic_item(datasets, text_pipeline)
 
@@ -369,7 +465,10 @@ def dataio_prep(hparams):
         sequence_input=True,
     )
 
-    sb.dataio.dataset.set_output_keys(datasets, ["id", "sig", "phn_encoded"])
+    sb.dataio.dataset.set_output_keys(
+        datasets,
+        ["id", "sig", "phn_encoded", "phn_list", "phn_end_list"],
+    )
 
     return train_data, valid_data, test_data, label_encoder
 
