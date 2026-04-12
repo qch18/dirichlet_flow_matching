@@ -19,7 +19,7 @@ data_folder: "E:/dfm_asr/data/TIMIT/data"
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
-skip_prep: TRUE
+skip_prep: FALSE
 uppercase: TRUE
 
 # Data for augmentation
