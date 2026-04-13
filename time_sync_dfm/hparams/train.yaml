@@ -7,7 +7,7 @@
 # ################################
 
 seed: 1986
-run_name: dfm_stage3_align
+run_name: dfm_stage4_bridge
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -19,7 +19,7 @@ data_folder: "E:/dfm_asr/data/TIMIT/data"
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
-skip_prep: FALSE
+skip_prep: TRUE
 uppercase: TRUE
 
 # Data for augmentation
@@ -116,7 +116,7 @@ wav_augment: !new:speechbrain.augment.augmenter.Augmenter
     max_augmentations: 2
     augment_prob: 0.5
     augmentations: [
-        !ref <add_noise>,
+        #!ref <add_noise>,  #REMOVED DUE TO CRASHING
         !ref <speed_perturb>,
         !ref <drop_freq>,
         !ref <drop_chunk>]

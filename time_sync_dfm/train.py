@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Stage 3: CTC ASR on TIMIT with Dirichlet initialization + frame-aligned target p1.
+"""Stage 4: CTC ASR on TIMIT with Dirichlet initialization + frame-aligned target p1 + bridge state pt.
 
 Adds:
 - A = softplus(logits) + eps
 - p0 = A / sum(A)
 - p1 = AlignToFrames(y, H)
+- pt = (1 - t) p0 + t p1
 
-Still NO bridge, NO velocity net, NO FM loss yet.
+Still NO velocity net, NO FM loss yet.
 Training remains plain CTC on p0.
 """
 
@@ -33,13 +34,10 @@ class ASR_Brain(sb.Brain):
             self.hparams.dfm_epsilon
         )
 
+    def bridge_state(self, p0, p1, t):
+        return (1.0 - t) * p0 + t * p1
+
     def build_frame_targets(self, batch, hidden, wav_lens):
-        """
-        Approximates AlignToFrames(y, H) using TIMIT phoneme end boundaries.
-        Returns:
-            frame_ids: [B, T_enc] long
-            frame_mask: [B, T_enc] float
-        """
         device = hidden.device
         B, T_enc = hidden.size(0), hidden.size(1)
 
@@ -79,9 +77,6 @@ class ASR_Brain(sb.Brain):
         return frame_ids, frame_mask
 
     def make_target_simplex(self, frame_ids):
-        """
-        Builds p1 as a smoothed one-hot framewise target distribution.
-        """
         p1 = F.one_hot(
             frame_ids, num_classes=self.hparams.output_neurons
         ).float()
@@ -103,6 +98,10 @@ class ASR_Brain(sb.Brain):
             "p1_entropy": 0.0,
             "p1_row_sum_mean": 0.0,
             "p1_min": 0.0,
+            "pt_entropy": 0.0,
+            "pt_row_sum_mean": 0.0,
+            "pt_min": 0.0,
+            "t_mean": 0.0,
             "blank_prob_mean": 0.0,
             "max_prob_mean": 0.0,
             "num_batches": 0,
@@ -115,12 +114,15 @@ class ASR_Brain(sb.Brain):
         alpha,
         p0,
         p1,
+        pt,
+        t_value,
         log_probs,
         grad_norm=None,
     ):
         probs = log_probs.exp()
         p0_entropy = -(p0 * p0.clamp_min(1e-8).log()).sum(dim=-1).mean()
         p1_entropy = -(p1 * p1.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        pt_entropy = -(pt * pt.clamp_min(1e-8).log()).sum(dim=-1).mean()
         blank_prob_mean = probs[..., self.hparams.blank_index].mean()
         max_prob_mean = probs.max(dim=-1).values.mean()
 
@@ -129,6 +131,7 @@ class ASR_Brain(sb.Brain):
         self.monitor_sums["logits_std"] += float(logits.std().detach().cpu())
         self.monitor_sums["alpha_mean"] += float(alpha.mean().detach().cpu())
         self.monitor_sums["alpha_std"] += float(alpha.std().detach().cpu())
+
         self.monitor_sums["p0_entropy"] += float(p0_entropy.detach().cpu())
         self.monitor_sums["p0_row_sum_mean"] += float(
             p0.sum(dim=-1).mean().detach().cpu()
@@ -140,6 +143,14 @@ class ASR_Brain(sb.Brain):
             p1.sum(dim=-1).mean().detach().cpu()
         )
         self.monitor_sums["p1_min"] += float(p1.min().detach().cpu())
+
+        self.monitor_sums["pt_entropy"] += float(pt_entropy.detach().cpu())
+        self.monitor_sums["pt_row_sum_mean"] += float(
+            pt.sum(dim=-1).mean().detach().cpu()
+        )
+        self.monitor_sums["pt_min"] += float(pt.min().detach().cpu())
+
+        self.monitor_sums["t_mean"] += float(t_value)
 
         self.monitor_sums["blank_prob_mean"] += float(blank_prob_mean.detach().cpu())
         self.monitor_sums["max_prob_mean"] += float(max_prob_mean.detach().cpu())
@@ -164,6 +175,10 @@ class ASR_Brain(sb.Brain):
             "p1_entropy": self.monitor_sums["p1_entropy"] / n,
             "p1_row_sum_mean": self.monitor_sums["p1_row_sum_mean"] / n,
             "p1_min": self.monitor_sums["p1_min"] / n,
+            "pt_entropy": self.monitor_sums["pt_entropy"] / n,
+            "pt_row_sum_mean": self.monitor_sums["pt_row_sum_mean"] / n,
+            "pt_min": self.monitor_sums["pt_min"] / n,
+            "t_mean": self.monitor_sums["t_mean"] / n,
             "blank_prob_mean": self.monitor_sums["blank_prob_mean"] / n,
             "max_prob_mean": self.monitor_sums["max_prob_mean"] / n,
         }
@@ -180,7 +195,6 @@ class ASR_Brain(sb.Brain):
         return total ** 0.5
 
     def compute_forward(self, batch, stage):
-        "Computes hidden states, logits, Dirichlet params, p0, and frame target p1."
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
 
@@ -190,15 +204,18 @@ class ASR_Brain(sb.Brain):
         feats = self.hparams.compute_features(wavs)
         feats = self.modules.normalize(feats, wav_lens)
 
-        hidden = self.modules.model(feats)           # H
-        logits = self.modules.output(hidden)         # Z
-        alpha = self.logits_to_dirichlet(logits)     # A
-        p0 = self.dirichlet_mean(alpha)              # start state
+        hidden = self.modules.model(feats)
+        logits = self.modules.output(hidden)
+        alpha = self.logits_to_dirichlet(logits)
+        p0 = self.dirichlet_mean(alpha)
 
         frame_ids, frame_mask = self.build_frame_targets(batch, hidden, wav_lens)
-        p1 = self.make_target_simplex(frame_ids)     # target endpoint
+        p1 = self.make_target_simplex(frame_ids)
 
-        log_probs = torch.log(p0.clamp_min(1e-8))    # still plain CTC on p0
+        t = torch.rand(1, device=hidden.device).item()
+        pt = self.bridge_state(p0, p1, t)
+
+        log_probs = torch.log(p0.clamp_min(1e-8))
 
         return {
             "hidden": hidden,
@@ -206,6 +223,8 @@ class ASR_Brain(sb.Brain):
             "alpha": alpha,
             "p0": p0,
             "p1": p1,
+            "pt": pt,
+            "t": t,
             "frame_ids": frame_ids,
             "frame_mask": frame_mask,
             "log_probs": log_probs,
@@ -213,12 +232,13 @@ class ASR_Brain(sb.Brain):
         }
 
     def compute_objectives(self, predictions, batch, stage):
-        "Computes plain CTC loss on p0."
         log_probs = predictions["log_probs"]
         logits = predictions["logits"]
         alpha = predictions["alpha"]
         p0 = predictions["p0"]
         p1 = predictions["p1"]
+        pt = predictions["pt"]
+        t = predictions["t"]
         pout_lens = predictions["wav_lens"]
 
         phns, phn_lens = batch.phn_encoded
@@ -235,6 +255,8 @@ class ASR_Brain(sb.Brain):
             "alpha": alpha.detach(),
             "p0": p0.detach(),
             "p1": p1.detach(),
+            "pt": pt.detach(),
+            "t": t,
             "log_probs": log_probs.detach(),
         }
 
@@ -258,6 +280,8 @@ class ASR_Brain(sb.Brain):
                 alpha=alpha,
                 p0=p0,
                 p1=p1,
+                pt=pt,
+                t_value=t,
                 log_probs=log_probs,
                 grad_norm=None,
             )
@@ -279,6 +303,8 @@ class ASR_Brain(sb.Brain):
             alpha=self.current_batch_stats["alpha"],
             p0=self.current_batch_stats["p0"],
             p1=self.current_batch_stats["p1"],
+            pt=self.current_batch_stats["pt"],
+            t_value=self.current_batch_stats["t"],
             log_probs=self.current_batch_stats["log_probs"],
             grad_norm=grad_norm,
         )
@@ -328,6 +354,10 @@ class ASR_Brain(sb.Brain):
                     "p1_entropy": self.train_monitor_stats["p1_entropy"],
                     "p1_row_sum_mean": self.train_monitor_stats["p1_row_sum_mean"],
                     "p1_min": self.train_monitor_stats["p1_min"],
+                    "pt_entropy": self.train_monitor_stats["pt_entropy"],
+                    "pt_row_sum_mean": self.train_monitor_stats["pt_row_sum_mean"],
+                    "pt_min": self.train_monitor_stats["pt_min"],
+                    "t_mean": self.train_monitor_stats["t_mean"],
                     "blank_prob_mean": self.train_monitor_stats["blank_prob_mean"],
                     "max_prob_mean": self.train_monitor_stats["max_prob_mean"],
                 },
@@ -345,6 +375,10 @@ class ASR_Brain(sb.Brain):
                     "p1_entropy": monitor_stats["p1_entropy"],
                     "p1_row_sum_mean": monitor_stats["p1_row_sum_mean"],
                     "p1_min": monitor_stats["p1_min"],
+                    "pt_entropy": monitor_stats["pt_entropy"],
+                    "pt_row_sum_mean": monitor_stats["pt_row_sum_mean"],
+                    "pt_min": monitor_stats["pt_min"],
+                    "t_mean": monitor_stats["t_mean"],
                     "blank_prob_mean": monitor_stats["blank_prob_mean"],
                     "max_prob_mean": monitor_stats["max_prob_mean"],
                 },
@@ -372,6 +406,10 @@ class ASR_Brain(sb.Brain):
                     "p1_entropy": monitor_stats["p1_entropy"],
                     "p1_row_sum_mean": monitor_stats["p1_row_sum_mean"],
                     "p1_min": monitor_stats["p1_min"],
+                    "pt_entropy": monitor_stats["pt_entropy"],
+                    "pt_row_sum_mean": monitor_stats["pt_row_sum_mean"],
+                    "pt_min": monitor_stats["pt_min"],
+                    "t_mean": monitor_stats["t_mean"],
                     "blank_prob_mean": monitor_stats["blank_prob_mean"],
                     "max_prob_mean": monitor_stats["max_prob_mean"],
                 },
@@ -385,15 +423,10 @@ class ASR_Brain(sb.Brain):
                     self.ctc_metrics.write_stats(w)
                     w.write("\nPER stats:\n")
                     self.per_metrics.write_stats(w)
-                    print(
-                        "CTC and PER stats written to ",
-                        self.hparams.test_wer_file,
-                    )
+                    print("CTC and PER stats written to ", self.hparams.test_wer_file)
 
 
 def dataio_prep(hparams):
-    "Creates the datasets and their data processing pipelines."
-
     data_folder = hparams["data_folder"]
 
     train_data = sb.dataio.dataset.DynamicItemDataset.from_json(
