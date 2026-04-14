@@ -1,44 +1,35 @@
 # ################################
-# Stage 2: CTC ASR on TIMIT with Dirichlet parameterisation
-# Adds:
-#   A = softplus(logits) + eps
-#   p0 = A / sum(A)
-# Still plain CTC training on p0
+# Stage 7: CTC + Flow Matching
 # ################################
 
 seed: 1986
-run_name: dfm_stage4_bridge
+run_name: dfm_stage7_fm_loss
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
-# Data files
 data_folder: "E:/dfm_asr/data/TIMIT/data"
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
 skip_prep: TRUE
-uppercase: TRUE
+uppercase: True
 
-# Data for augmentation
 data_folder_noise: !ref <data_folder>/noise
 NOISE_DATASET_URL: https://www.dropbox.com/scl/fi/a09pj97s5ifan81dqhi4n/noises.zip?rlkey=j8b0n9kdjdr32o1f06t0cw5b7&dl=1
 noise_annotation: !ref <save_folder>/noise.csv
 
-####################### Training Parameters ####################################
 number_of_epochs: 40
 batch_size: 16
 lr: 1.0
 sorting: ascending
 
-# Feature parameters
 sample_rate: 16000
 n_fft: 400
 n_mels: 40
 
-####################### Model Parameters #######################################
 activation: !name:torch.nn.LeakyReLU
 dropout: 0.15
 cnn_blocks: 2
@@ -50,17 +41,16 @@ rnn_bidirectional: True
 dnn_blocks: 2
 dnn_neurons: 512
 
-# Outputs
 output_neurons: 40
 blank_index: 0
 
-# Stage 2 DFM parameter
 dfm_epsilon: 1.0e-6
-
-#  Stage 3 DFM parameter 
 target_smoothing: 0.02
+velocity_hidden: 256
 
-# Dataloader options
+lambda_ctc: 1.0
+lambda_fm: 0.1
+
 num_workers: 0
 train_dataloader_opts:
     batch_size: !ref <batch_size>
@@ -76,8 +66,6 @@ test_dataloader_opts:
 
 normalize: !new:speechbrain.processing.features.InputNormalization
     norm_type: global
-
-############################## Augmentations ###################################
 
 prepare_noise_data: !name:speechbrain.augment.preparation.prepare_dataset_from_URL
     URL: !ref <NOISE_DATASET_URL>
@@ -116,12 +104,10 @@ wav_augment: !new:speechbrain.augment.augmenter.Augmenter
     max_augmentations: 2
     augment_prob: 0.5
     augmentations: [
-        #!ref <add_noise>,  #REMOVED DUE TO CRASHING
         !ref <speed_perturb>,
         !ref <drop_freq>,
-        !ref <drop_chunk>]
-
-############################## Models ##########################################
+        !ref <drop_chunk>
+    ]
 
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
@@ -150,6 +136,11 @@ output: !new:speechbrain.nnet.linear.Linear
     n_neurons: !ref <output_neurons>
     bias: True
 
+velocity_net: !new:__main__.VelocityNet
+    vocab_size: !ref <output_neurons>
+    hidden_size: !ref <dnn_neurons>
+    velocity_hidden: !ref <velocity_hidden>
+
 log_softmax: !new:speechbrain.nnet.activations.Softmax
     apply_log: True
 
@@ -167,6 +158,7 @@ lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
 modules:
     model: !ref <model>
     output: !ref <output>
+    velocity_net: !ref <velocity_net>
     normalize: !ref <normalize>
 
 jit_module_keys: [model]
@@ -176,6 +168,7 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     recoverables:
         model: !ref <model>
         output: !ref <output>
+        velocity_net: !ref <velocity_net>
         scheduler: !ref <lr_annealing>
         normalizer: !ref <normalize>
         counter: !ref <epoch_counter>

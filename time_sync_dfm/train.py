@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Stage 4: CTC ASR on TIMIT with Dirichlet initialization + frame-aligned target p1 + bridge state pt.
+"""Stage 7: CTC ASR on TIMIT with trainable flow-matching loss.
 
 Adds:
-- A = softplus(logits) + eps
-- p0 = A / sum(A)
-- p1 = AlignToFrames(y, H)
-- pt = (1 - t) p0 + t p1
-
-Still NO velocity net, NO FM loss yet.
-Training remains plain CTC on p0.
+- learned velocity network v_theta(pt, t, H)
+- target velocity vt* = p1 - p0
+- FM loss = ||vpred - vt||^2
+- total loss = lambda_ctc * ctc_loss + lambda_fm * fm_loss
 """
 
 import os
 import sys
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from hyperpyyaml import load_hyperpyyaml
 
@@ -23,6 +21,30 @@ from speechbrain.utils.distributed import if_main_process, run_on_main
 from speechbrain.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class VelocityNet(nn.Module):
+    def __init__(self, vocab_size, hidden_size, velocity_hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(vocab_size + hidden_size + 1, velocity_hidden),
+            nn.ReLU(),
+            nn.Linear(velocity_hidden, velocity_hidden),
+            nn.ReLU(),
+            nn.Linear(velocity_hidden, vocab_size),
+        )
+
+    def forward(self, pt, t, hidden):
+        t_tensor = torch.full(
+            (pt.size(0), pt.size(1), 1),
+            float(t),
+            device=pt.device,
+            dtype=pt.dtype,
+        )
+        inp = torch.cat([pt, hidden, t_tensor], dim=-1)
+        v = self.net(inp)
+        v = v - v.mean(dim=-1, keepdim=True)
+        return v
 
 
 class ASR_Brain(sb.Brain):
@@ -36,6 +58,9 @@ class ASR_Brain(sb.Brain):
 
     def bridge_state(self, p0, p1, t):
         return (1.0 - t) * p0 + t * p1
+
+    def target_velocity(self, p0, p1):
+        return p1 - p0
 
     def build_frame_targets(self, batch, hidden, wav_lens):
         device = hidden.device
@@ -86,7 +111,9 @@ class ASR_Brain(sb.Brain):
 
     def _init_monitor_sums(self):
         self.monitor_sums = {
+            "loss": 0.0,
             "ctc_loss": 0.0,
+            "fm_loss": 0.0,
             "grad_norm": 0.0,
             "logits_mean": 0.0,
             "logits_std": 0.0,
@@ -101,6 +128,14 @@ class ASR_Brain(sb.Brain):
             "pt_entropy": 0.0,
             "pt_row_sum_mean": 0.0,
             "pt_min": 0.0,
+            "vt_mean_abs": 0.0,
+            "vt_l2": 0.0,
+            "vt_sum_mean": 0.0,
+            "vpred_mean_abs": 0.0,
+            "vpred_l2": 0.0,
+            "vpred_sum_mean": 0.0,
+            "velocity_mse_monitor": 0.0,
+            "velocity_cosine_monitor": 0.0,
             "t_mean": 0.0,
             "blank_prob_mean": 0.0,
             "max_prob_mean": 0.0,
@@ -109,12 +144,16 @@ class ASR_Brain(sb.Brain):
 
     def _update_monitor_sums(
         self,
+        total_loss,
         ctc_loss,
+        fm_loss,
         logits,
         alpha,
         p0,
         p1,
         pt,
+        vt,
+        vpred,
         t_value,
         log_probs,
         grad_norm=None,
@@ -126,7 +165,20 @@ class ASR_Brain(sb.Brain):
         blank_prob_mean = probs[..., self.hparams.blank_index].mean()
         max_prob_mean = probs.max(dim=-1).values.mean()
 
+        vt_mean_abs = vt.abs().mean()
+        vt_l2 = torch.sqrt((vt ** 2).sum(dim=-1)).mean()
+        vt_sum_mean = vt.sum(dim=-1).mean()
+
+        vpred_mean_abs = vpred.abs().mean()
+        vpred_l2 = torch.sqrt((vpred ** 2).sum(dim=-1)).mean()
+        vpred_sum_mean = vpred.sum(dim=-1).mean()
+
+        velocity_mse_monitor = ((vpred - vt) ** 2).mean()
+        cos = F.cosine_similarity(vpred, vt, dim=-1).mean()
+
+        self.monitor_sums["loss"] += float(total_loss.detach().cpu())
         self.monitor_sums["ctc_loss"] += float(ctc_loss.detach().cpu())
+        self.monitor_sums["fm_loss"] += float(fm_loss.detach().cpu())
         self.monitor_sums["logits_mean"] += float(logits.mean().detach().cpu())
         self.monitor_sums["logits_std"] += float(logits.std().detach().cpu())
         self.monitor_sums["alpha_mean"] += float(alpha.mean().detach().cpu())
@@ -150,8 +202,19 @@ class ASR_Brain(sb.Brain):
         )
         self.monitor_sums["pt_min"] += float(pt.min().detach().cpu())
 
-        self.monitor_sums["t_mean"] += float(t_value)
+        self.monitor_sums["vt_mean_abs"] += float(vt_mean_abs.detach().cpu())
+        self.monitor_sums["vt_l2"] += float(vt_l2.detach().cpu())
+        self.monitor_sums["vt_sum_mean"] += float(vt_sum_mean.detach().cpu())
 
+        self.monitor_sums["vpred_mean_abs"] += float(vpred_mean_abs.detach().cpu())
+        self.monitor_sums["vpred_l2"] += float(vpred_l2.detach().cpu())
+        self.monitor_sums["vpred_sum_mean"] += float(vpred_sum_mean.detach().cpu())
+        self.monitor_sums["velocity_mse_monitor"] += float(
+            velocity_mse_monitor.detach().cpu()
+        )
+        self.monitor_sums["velocity_cosine_monitor"] += float(cos.detach().cpu())
+
+        self.monitor_sums["t_mean"] += float(t_value)
         self.monitor_sums["blank_prob_mean"] += float(blank_prob_mean.detach().cpu())
         self.monitor_sums["max_prob_mean"] += float(max_prob_mean.detach().cpu())
 
@@ -162,26 +225,7 @@ class ASR_Brain(sb.Brain):
 
     def _get_monitor_averages(self):
         n = max(self.monitor_sums["num_batches"], 1)
-        return {
-            "ctc_loss": self.monitor_sums["ctc_loss"] / n,
-            "grad_norm": self.monitor_sums["grad_norm"] / n,
-            "logits_mean": self.monitor_sums["logits_mean"] / n,
-            "logits_std": self.monitor_sums["logits_std"] / n,
-            "alpha_mean": self.monitor_sums["alpha_mean"] / n,
-            "alpha_std": self.monitor_sums["alpha_std"] / n,
-            "p0_entropy": self.monitor_sums["p0_entropy"] / n,
-            "p0_row_sum_mean": self.monitor_sums["p0_row_sum_mean"] / n,
-            "p0_min": self.monitor_sums["p0_min"] / n,
-            "p1_entropy": self.monitor_sums["p1_entropy"] / n,
-            "p1_row_sum_mean": self.monitor_sums["p1_row_sum_mean"] / n,
-            "p1_min": self.monitor_sums["p1_min"] / n,
-            "pt_entropy": self.monitor_sums["pt_entropy"] / n,
-            "pt_row_sum_mean": self.monitor_sums["pt_row_sum_mean"] / n,
-            "pt_min": self.monitor_sums["pt_min"] / n,
-            "t_mean": self.monitor_sums["t_mean"] / n,
-            "blank_prob_mean": self.monitor_sums["blank_prob_mean"] / n,
-            "max_prob_mean": self.monitor_sums["max_prob_mean"] / n,
-        }
+        return {k: (v / n if k != "num_batches" else v) for k, v in self.monitor_sums.items() if k != "num_batches"}
 
     def _get_grad_norm(self):
         total = 0.0
@@ -214,6 +258,8 @@ class ASR_Brain(sb.Brain):
 
         t = torch.rand(1, device=hidden.device).item()
         pt = self.bridge_state(p0, p1, t)
+        vt = self.target_velocity(p0, p1)
+        vpred = self.modules.velocity_net(pt, t, hidden)
 
         log_probs = torch.log(p0.clamp_min(1e-8))
 
@@ -224,6 +270,8 @@ class ASR_Brain(sb.Brain):
             "p0": p0,
             "p1": p1,
             "pt": pt,
+            "vt": vt,
+            "vpred": vpred,
             "t": t,
             "frame_ids": frame_ids,
             "frame_mask": frame_mask,
@@ -238,7 +286,10 @@ class ASR_Brain(sb.Brain):
         p0 = predictions["p0"]
         p1 = predictions["p1"]
         pt = predictions["pt"]
+        vt = predictions["vt"]
+        vpred = predictions["vpred"]
         t = predictions["t"]
+        frame_mask = predictions["frame_mask"]
         pout_lens = predictions["wav_lens"]
 
         phns, phn_lens = batch.phn_encoded
@@ -249,13 +300,25 @@ class ASR_Brain(sb.Brain):
 
         ctc_loss = self.hparams.compute_cost(log_probs, phns, pout_lens, phn_lens)
 
+        fm_sq = ((vpred - vt) ** 2).mean(dim=-1)
+        fm_loss = (fm_sq * frame_mask).sum() / frame_mask.sum().clamp_min(1.0)
+
+        total_loss = (
+            self.hparams.lambda_ctc * ctc_loss
+            + self.hparams.lambda_fm * fm_loss
+        )
+
         self.current_batch_stats = {
+            "loss": total_loss.detach(),
             "ctc_loss": ctc_loss.detach(),
+            "fm_loss": fm_loss.detach(),
             "logits": logits.detach(),
             "alpha": alpha.detach(),
             "p0": p0.detach(),
             "p1": p1.detach(),
             "pt": pt.detach(),
+            "vt": vt.detach(),
+            "vpred": vpred.detach(),
             "t": t,
             "log_probs": log_probs.detach(),
         }
@@ -275,18 +338,22 @@ class ASR_Brain(sb.Brain):
             )
 
             self._update_monitor_sums(
+                total_loss=total_loss,
                 ctc_loss=ctc_loss,
+                fm_loss=fm_loss,
                 logits=logits,
                 alpha=alpha,
                 p0=p0,
                 p1=p1,
                 pt=pt,
+                vt=vt,
+                vpred=vpred,
                 t_value=t,
                 log_probs=log_probs,
                 grad_norm=None,
             )
 
-        return ctc_loss
+        return total_loss
 
     def fit_batch(self, batch):
         predictions = self.compute_forward(batch, sb.Stage.TRAIN)
@@ -298,12 +365,16 @@ class ASR_Brain(sb.Brain):
         grad_norm = self._get_grad_norm()
 
         self._update_monitor_sums(
+            total_loss=self.current_batch_stats["loss"],
             ctc_loss=self.current_batch_stats["ctc_loss"],
+            fm_loss=self.current_batch_stats["fm_loss"],
             logits=self.current_batch_stats["logits"],
             alpha=self.current_batch_stats["alpha"],
             p0=self.current_batch_stats["p0"],
             p1=self.current_batch_stats["p1"],
             pt=self.current_batch_stats["pt"],
+            vt=self.current_batch_stats["vt"],
+            vpred=self.current_batch_stats["vpred"],
             t_value=self.current_batch_stats["t"],
             log_probs=self.current_batch_stats["log_probs"],
             grad_norm=grad_norm,
@@ -321,7 +392,6 @@ class ASR_Brain(sb.Brain):
     def on_stage_start(self, stage, epoch):
         self.ctc_metrics = self.hparams.ctc_stats()
         self._init_monitor_sums()
-
         if stage != sb.Stage.TRAIN:
             self.per_metrics = self.hparams.per_stats()
 
@@ -340,48 +410,8 @@ class ASR_Brain(sb.Brain):
 
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": old_lr},
-                train_stats={
-                    "loss": self.train_loss,
-                    "ctc_loss": self.train_monitor_stats["ctc_loss"],
-                    "grad_norm": self.train_monitor_stats["grad_norm"],
-                    "logits_mean": self.train_monitor_stats["logits_mean"],
-                    "logits_std": self.train_monitor_stats["logits_std"],
-                    "alpha_mean": self.train_monitor_stats["alpha_mean"],
-                    "alpha_std": self.train_monitor_stats["alpha_std"],
-                    "p0_entropy": self.train_monitor_stats["p0_entropy"],
-                    "p0_row_sum_mean": self.train_monitor_stats["p0_row_sum_mean"],
-                    "p0_min": self.train_monitor_stats["p0_min"],
-                    "p1_entropy": self.train_monitor_stats["p1_entropy"],
-                    "p1_row_sum_mean": self.train_monitor_stats["p1_row_sum_mean"],
-                    "p1_min": self.train_monitor_stats["p1_min"],
-                    "pt_entropy": self.train_monitor_stats["pt_entropy"],
-                    "pt_row_sum_mean": self.train_monitor_stats["pt_row_sum_mean"],
-                    "pt_min": self.train_monitor_stats["pt_min"],
-                    "t_mean": self.train_monitor_stats["t_mean"],
-                    "blank_prob_mean": self.train_monitor_stats["blank_prob_mean"],
-                    "max_prob_mean": self.train_monitor_stats["max_prob_mean"],
-                },
-                valid_stats={
-                    "loss": stage_loss,
-                    "PER": per,
-                    "ctc_loss": monitor_stats["ctc_loss"],
-                    "logits_mean": monitor_stats["logits_mean"],
-                    "logits_std": monitor_stats["logits_std"],
-                    "alpha_mean": monitor_stats["alpha_mean"],
-                    "alpha_std": monitor_stats["alpha_std"],
-                    "p0_entropy": monitor_stats["p0_entropy"],
-                    "p0_row_sum_mean": monitor_stats["p0_row_sum_mean"],
-                    "p0_min": monitor_stats["p0_min"],
-                    "p1_entropy": monitor_stats["p1_entropy"],
-                    "p1_row_sum_mean": monitor_stats["p1_row_sum_mean"],
-                    "p1_min": monitor_stats["p1_min"],
-                    "pt_entropy": monitor_stats["pt_entropy"],
-                    "pt_row_sum_mean": monitor_stats["pt_row_sum_mean"],
-                    "pt_min": monitor_stats["pt_min"],
-                    "t_mean": monitor_stats["t_mean"],
-                    "blank_prob_mean": monitor_stats["blank_prob_mean"],
-                    "max_prob_mean": monitor_stats["max_prob_mean"],
-                },
+                train_stats=self.train_monitor_stats,
+                valid_stats={"PER": per, **monitor_stats},
             )
 
             self.checkpointer.save_and_keep_only(
@@ -392,33 +422,11 @@ class ASR_Brain(sb.Brain):
         elif stage == sb.Stage.TEST:
             self.hparams.train_logger.log_stats(
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats={
-                    "loss": stage_loss,
-                    "PER": per,
-                    "ctc_loss": monitor_stats["ctc_loss"],
-                    "logits_mean": monitor_stats["logits_mean"],
-                    "logits_std": monitor_stats["logits_std"],
-                    "alpha_mean": monitor_stats["alpha_mean"],
-                    "alpha_std": monitor_stats["alpha_std"],
-                    "p0_entropy": monitor_stats["p0_entropy"],
-                    "p0_row_sum_mean": monitor_stats["p0_row_sum_mean"],
-                    "p0_min": monitor_stats["p0_min"],
-                    "p1_entropy": monitor_stats["p1_entropy"],
-                    "p1_row_sum_mean": monitor_stats["p1_row_sum_mean"],
-                    "p1_min": monitor_stats["p1_min"],
-                    "pt_entropy": monitor_stats["pt_entropy"],
-                    "pt_row_sum_mean": monitor_stats["pt_row_sum_mean"],
-                    "pt_min": monitor_stats["pt_min"],
-                    "t_mean": monitor_stats["t_mean"],
-                    "blank_prob_mean": monitor_stats["blank_prob_mean"],
-                    "max_prob_mean": monitor_stats["max_prob_mean"],
-                },
+                test_stats={"PER": per, **monitor_stats},
             )
 
             if if_main_process():
-                with open(
-                    self.hparams.test_wer_file, "w", encoding="utf-8"
-                ) as w:
+                with open(self.hparams.test_wer_file, "w", encoding="utf-8") as w:
                     w.write("CTC loss stats:\n")
                     self.ctc_metrics.write_stats(w)
                     w.write("\nPER stats:\n")
@@ -437,32 +445,23 @@ def dataio_prep(hparams):
     if hparams["sorting"] == "ascending":
         train_data = train_data.filtered_sorted(sort_key="duration")
         hparams["train_dataloader_opts"]["shuffle"] = False
-
     elif hparams["sorting"] == "descending":
-        train_data = train_data.filtered_sorted(
-            sort_key="duration", reverse=True
-        )
+        train_data = train_data.filtered_sorted(sort_key="duration", reverse=True)
         hparams["train_dataloader_opts"]["shuffle"] = False
-
     elif hparams["sorting"] == "random":
         pass
-
     else:
-        raise NotImplementedError(
-            "sorting must be random, ascending or descending"
-        )
+        raise NotImplementedError("sorting must be random, ascending or descending")
 
     valid_data = sb.dataio.dataset.DynamicItemDataset.from_json(
         json_path=hparams["valid_annotation"],
         replacements={"data_root": data_folder},
-    )
-    valid_data = valid_data.filtered_sorted(sort_key="duration")
+    ).filtered_sorted(sort_key="duration")
 
     test_data = sb.dataio.dataset.DynamicItemDataset.from_json(
         json_path=hparams["test_annotation"],
         replacements={"data_root": data_folder},
-    )
-    test_data = test_data.filtered_sorted(sort_key="duration")
+    ).filtered_sorted(sort_key="duration")
 
     datasets = [train_data, valid_data, test_data]
     label_encoder = sb.dataio.encoder.CTCTextEncoder()
@@ -470,8 +469,7 @@ def dataio_prep(hparams):
     @sb.utils.data_pipeline.takes("wav")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
-        sig = sb.dataio.dataio.read_audio(wav)
-        return sig
+        return sb.dataio.dataio.read_audio(wav)
 
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline)
 
@@ -480,12 +478,8 @@ def dataio_prep(hparams):
     def text_pipeline(phn, ground_truth_phn_ends):
         phn_list = phn.strip().split()
         yield phn_list
-
-        phn_encoded = label_encoder.encode_sequence_torch(phn_list)
-        yield phn_encoded
-
-        phn_end_list = [int(x) for x in ground_truth_phn_ends.strip().split()]
-        yield phn_end_list
+        yield label_encoder.encode_sequence_torch(phn_list)
+        yield [int(x) for x in ground_truth_phn_ends.strip().split()]
 
     sb.dataio.dataset.add_dynamic_item(datasets, text_pipeline)
 
