@@ -1,18 +1,15 @@
 # ################################
-# Stage 8: CTC + Proper Dirichlet Flow Matching
+# Stage 8b: CTC + DFM with frame-aligned flow decoding
 #
-# Changes from Stage 7 train.yaml:
-# 1. run_name changed to dfm_stage8_flow_integration
-# 2. Added num_flow_steps (number of Euler steps for ODE integration at eval)
-# 3. skip_prep set to TRUE (assumes data is already prepared)
-#
-# The key difference is that validation/test now integrates the velocity field
-# from t=0 to t=1 using Euler steps, so the flow output actually produces
-# the predictions. Training still uses p0 for CTC speed.
+# Changes from Stage 8:
+# 1. run_name: dfm_stage8b_frame_decode
+# 2. lambda_fm raised to 0.5 (stronger FM supervision for better velocity)
+# 3. num_flow_steps: 10 (Euler integration steps at inference)
+# 4. LR scheduling uses p0 PER for stability
 # ################################
 
 seed: 1986
-run_name: dfm_stage8_flow_integration
+run_name: dfm_stage8b_frame_decode
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -26,7 +23,7 @@ data_folder: "E:/dfm_asr/data/TIMIT/data"
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
-skip_prep: TRUE
+skip_prep: False
 uppercase: True
 
 # ----------------------------------------------------------------------
@@ -78,18 +75,15 @@ dfm_epsilon: 1.0e-6
 target_smoothing: 0.02
 velocity_hidden: 256
 
-# NEW (Change 3): Number of Euler steps for ODE integration at inference.
-# More steps = more accurate flow trajectory but slower validation.
-# 10 is a good balance. You can experiment with 4, 10, 20.
+# Euler integration steps at inference (10 is a good balance)
 num_flow_steps: 10
 
 # ----------------------------------------------------------------------
 # Hybrid loss weights
-# lambda_ctc: weight for the CTC loss (trains encoder to produce good logits)
-# lambda_fm:  weight for the FM loss (trains velocity network to learn the flow)
+# lambda_fm raised to 0.5 to give velocity network stronger supervision
 # ----------------------------------------------------------------------
 lambda_ctc: 1.0
-lambda_fm: 0.1
+lambda_fm: 0.5
 
 # ----------------------------------------------------------------------
 # Dataloader options
@@ -172,7 +166,7 @@ compute_features: !new:speechbrain.lobes.features.Fbank
     n_mels: !ref <n_mels>
 
 # ----------------------------------------------------------------------
-# Encoder (CRDNN acoustic model, same architecture as baseline)
+# Encoder (CRDNN acoustic model)
 # ----------------------------------------------------------------------
 model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     input_size: !ref <n_mels>
@@ -222,7 +216,7 @@ lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
 # ----------------------------------------------------------------------
 modules:
     model: !ref <model>
-    output: !ref <output>
+    output: !ref <o>
     velocity_net: !ref <velocity_net>
     normalize: !ref <normalize>
 
@@ -235,7 +229,7 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
-        output: !ref <output>
+        output: !ref <o>
         velocity_net: !ref <velocity_net>
         scheduler: !ref <lr_annealing>
         normalizer: !ref <normalize>

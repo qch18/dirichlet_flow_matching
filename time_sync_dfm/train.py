@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""Stage 8: CTC ASR on TIMIT with proper Dirichlet Flow Matching.
+"""Stage 8b: CTC ASR on TIMIT with proper Dirichlet Flow Matching.
 
-Changes from Stage 7:
+Changes from Stage 8:
 ---------------------
-1. Added integrate_flow() - Euler ODE integration of the learned velocity field
-   from t=0 to t=1. This is the missing piece that turns the velocity network
-   from a side loss into an actual generative flow that produces predictions.
+KEY FIX: Flow decoding now uses frame-aligned argmax + collapse, NOT CTC
+greedy decode. The flow is trained to match frame-level phoneme targets from
+AlignToFrames, so its output already has explicit time alignment. CTC greedy
+decode fails because it expects blank-heavy output for implicit alignment.
 
-2. Modified compute_forward() - During validation/test, the model now integrates
-   the flow and decodes from the flow-evolved distribution instead of raw p0.
-   During training, CTC still uses p0 for speed (FM loss still trains velocity net).
+The two decoding strategies compared:
+  - p0 path:   CTC greedy decode (implicit alignment via blanks)
+  - flow path: argmax per frame -> collapse consecutive duplicates -> remove
+               blanks (explicit alignment from AlignToFrames + learned flow)
 
-3. Added dual PER tracking - At validation, both p0 PER and flow PER are computed
-   and logged. This lets you directly compare whether the flow improves predictions
-   over the raw encoder output.
+Also changed: LR scheduling and checkpointing use p0 PER (stable CTC metric)
+so that the learning rate is not destabilised by early-epoch flow noise.
 
-4. Added flow monitoring stats - flow_entropy and flow_p0_delta track how much
-   the flow changes the distribution during integration.
-
-5. LR scheduler now uses flow PER - The learning rate and checkpoint selection
-   are based on the flow-evolved PER, since that is the actual system output.
-
-Algorithm reference (from dissertation Algorithm 2):
+Algorithm reference (Algorithm 2 from dissertation):
   Training: sample t, build bridge pt* = (1-t)p0 + tp1, compute target velocity
             vt* = p1-p0, predict v_hat = v_theta(pt*, t, H), loss = ||v_hat - vt*||^2
   Inference: start from p0, integrate dp/dt = v_theta(p, t, H) from t=0 to t=1
-             using Euler steps, decode from the resulting p_final
+             using Euler steps, decode from the resulting p_final using argmax+collapse
 """
 
 import os
@@ -71,8 +66,6 @@ class VelocityNet(nn.Module):
         )
         inp = torch.cat([pt, hidden, t_tensor], dim=-1)
         v = self.net(inp)
-        # Zero-mean constraint: velocity should not change the sum of
-        # probabilities, so we subtract the mean across the vocab dimension.
         v = v - v.mean(dim=-1, keepdim=True)
         return v
 
@@ -80,54 +73,40 @@ class VelocityNet(nn.Module):
 class ASR_Brain(sb.Brain):
 
     # ------------------------------------------------------------------
-    # Dirichlet parametrisation helpers (unchanged from Stage 7)
+    # Dirichlet parametrisation helpers
     # ------------------------------------------------------------------
 
     def logits_to_dirichlet(self, logits):
-        """Convert raw logits to positive Dirichlet concentration parameters.
-        Matches Algorithm 2 line 7: A = softplus(Z) + epsilon."""
+        """Algorithm 2 line 7: A = softplus(Z) + epsilon."""
         return F.softplus(logits) + self.hparams.dfm_epsilon
 
     def dirichlet_mean(self, alpha):
-        """Compute the Dirichlet mean (Option A from Algorithm 2 line 8).
-        p0 = alpha / sum(alpha) for each frame."""
+        """Algorithm 2 line 8 Option A: p0 = alpha / sum(alpha)."""
         return alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(
             self.hparams.dfm_epsilon
         )
 
     # ------------------------------------------------------------------
-    # Bridge and velocity (unchanged from Stage 7)
+    # Bridge and velocity
     # ------------------------------------------------------------------
 
     def bridge_state(self, p0, p1, t):
-        """Simplex linear bridge: phi_t(p0, p1) = (1-t)*p0 + t*p1.
-        Matches Algorithm 2 line 10 with the linear bridge choice."""
+        """Algorithm 2 line 10: linear bridge phi_t = (1-t)*p0 + t*p1."""
         return (1.0 - t) * p0 + t * p1
 
     def target_velocity(self, p0, p1):
-        """Analytic derivative of the linear bridge: d/dt phi_t = p1 - p0.
-        Matches Algorithm 2 line 11. This is constant for all t."""
+        """Algorithm 2 line 11: d/dt phi_t = p1 - p0 (constant for linear bridge)."""
         return p1 - p0
 
     # ------------------------------------------------------------------
-    # NEW: ODE integration for inference (Change 1)
+    # ODE integration for inference
     # ------------------------------------------------------------------
 
     def integrate_flow(self, p0, hidden, num_steps):
         """Euler integration of the learned velocity field from t=0 to t=1.
 
-        This is the inference procedure that makes the velocity network
-        actually produce predictions. At each step:
-          p(t + dt) = p(t) + dt * v_theta(p(t), t, H)
+        At each step: p(t + dt) = p(t) + dt * v_theta(p(t), t, H)
         then project back onto the simplex (clamp + renormalise).
-
-        Args:
-            p0: Initial simplex state [B, T, V] from Dirichlet mean
-            hidden: Encoder hidden states [B, T, D] for conditioning
-            num_steps: Number of Euler steps (more = more accurate but slower)
-
-        Returns:
-            p_final: Flow-evolved distribution [B, T, V] on the simplex
         """
         dt = 1.0 / num_steps
         p = p0.clone()
@@ -135,9 +114,6 @@ class ASR_Brain(sb.Brain):
         for step in range(num_steps):
             v = self.modules.velocity_net(p, t, hidden)
             p = p + dt * v
-            # Project back onto the simplex after each step.
-            # Without this, numerical drift causes values to go negative
-            # or not sum to 1, which breaks the probability interpretation.
             p = p.clamp_min(self.hparams.dfm_epsilon)
             p = p / p.sum(dim=-1, keepdim=True).clamp_min(
                 self.hparams.dfm_epsilon
@@ -146,12 +122,58 @@ class ASR_Brain(sb.Brain):
         return p
 
     # ------------------------------------------------------------------
-    # Frame-level target construction (unchanged from Stage 7)
+    # Flow decoding: frame-aligned argmax + collapse (KEY CHANGE)
+    # ------------------------------------------------------------------
+
+    def decode_flow_output(self, p_flow, pout_lens):
+        """Decode flow output using frame-aligned argmax + collapse.
+
+        The flow is trained to match frame-level phoneme targets from
+        AlignToFrames. Its output already has EXPLICIT time alignment,
+        unlike CTC which uses IMPLICIT alignment via blank tokens.
+
+        Decoding procedure:
+          1. argmax at each frame -> most likely phoneme per frame
+          2. Collapse consecutive duplicate predictions
+          3. Remove blank tokens from the collapsed sequence
+
+        This is analogous to how you would read off phonemes from a
+        forced-alignment output, not how you would decode CTC.
+        """
+        frame_preds = p_flow.argmax(dim=-1)  # [B, T]
+        B, T = frame_preds.size()
+
+        sequences = []
+        for b in range(B):
+            length = int(round(float(pout_lens[b]) * T))
+            length = max(1, min(T, length))
+            raw = frame_preds[b, :length].tolist()
+
+            # Collapse consecutive duplicates
+            # e.g. [sil, sil, aa, aa, aa, sil, b, b] -> [sil, aa, sil, b]
+            collapsed = []
+            prev = None
+            for idx in raw:
+                if idx != prev:
+                    collapsed.append(idx)
+                    prev = idx
+
+            # Remove blank tokens
+            collapsed = [
+                x for x in collapsed if x != self.hparams.blank_index
+            ]
+
+            sequences.append(collapsed)
+
+        return sequences
+
+    # ------------------------------------------------------------------
+    # Frame-level target construction
     # ------------------------------------------------------------------
 
     def build_frame_targets(self, batch, hidden, wav_lens):
-        """Map phoneme-level labels to frame-level targets using TIMIT boundaries.
-        Matches Algorithm 2 line 9: p1 = AlignToFrames(y, H)."""
+        """Algorithm 2 line 9: p1 = AlignToFrames(y, H).
+        Maps phoneme-level labels to frame-level targets using TIMIT boundaries."""
         device = hidden.device
         B, T_enc = hidden.size(0), hidden.size(1)
 
@@ -161,7 +183,9 @@ class ASR_Brain(sb.Brain):
             dtype=torch.long,
             device=device,
         )
-        frame_mask = torch.zeros((B, T_enc), dtype=torch.float32, device=device)
+        frame_mask = torch.zeros(
+            (B, T_enc), dtype=torch.float32, device=device
+        )
 
         max_wav_len = batch.sig[0].size(1)
 
@@ -193,7 +217,7 @@ class ASR_Brain(sb.Brain):
         return frame_ids, frame_mask
 
     def make_target_simplex(self, frame_ids):
-        """Convert frame-level phoneme IDs to smoothed one-hot target distributions."""
+        """Convert frame-level phoneme IDs to smoothed one-hot distributions."""
         p1 = F.one_hot(
             frame_ids, num_classes=self.hparams.output_neurons
         ).float()
@@ -235,7 +259,6 @@ class ASR_Brain(sb.Brain):
             "t_mean": 0.0,
             "blank_prob_mean": 0.0,
             "max_prob_mean": 0.0,
-            # NEW (Change 4): flow-specific monitoring
             "flow_entropy": 0.0,
             "flow_p0_delta": 0.0,
             "num_batches": 0,
@@ -256,7 +279,6 @@ class ASR_Brain(sb.Brain):
         t_value,
         log_probs,
         grad_norm=None,
-        # NEW (Change 4): optional flow stats
         p_flow=None,
     ):
         probs = log_probs.exp()
@@ -281,9 +303,15 @@ class ASR_Brain(sb.Brain):
         self.monitor_sums["loss"] += float(total_loss.detach().cpu())
         self.monitor_sums["ctc_loss"] += float(ctc_loss.detach().cpu())
         self.monitor_sums["fm_loss"] += float(fm_loss.detach().cpu())
-        self.monitor_sums["logits_mean"] += float(logits.mean().detach().cpu())
-        self.monitor_sums["logits_std"] += float(logits.std().detach().cpu())
-        self.monitor_sums["alpha_mean"] += float(alpha.mean().detach().cpu())
+        self.monitor_sums["logits_mean"] += float(
+            logits.mean().detach().cpu()
+        )
+        self.monitor_sums["logits_std"] += float(
+            logits.std().detach().cpu()
+        )
+        self.monitor_sums["alpha_mean"] += float(
+            alpha.mean().detach().cpu()
+        )
         self.monitor_sums["alpha_std"] += float(alpha.std().detach().cpu())
 
         self.monitor_sums["p0_entropy"] += float(p0_entropy.detach().cpu())
@@ -304,9 +332,13 @@ class ASR_Brain(sb.Brain):
         )
         self.monitor_sums["pt_min"] += float(pt.min().detach().cpu())
 
-        self.monitor_sums["vt_mean_abs"] += float(vt_mean_abs.detach().cpu())
+        self.monitor_sums["vt_mean_abs"] += float(
+            vt_mean_abs.detach().cpu()
+        )
         self.monitor_sums["vt_l2"] += float(vt_l2.detach().cpu())
-        self.monitor_sums["vt_sum_mean"] += float(vt_sum_mean.detach().cpu())
+        self.monitor_sums["vt_sum_mean"] += float(
+            vt_sum_mean.detach().cpu()
+        )
 
         self.monitor_sums["vpred_mean_abs"] += float(
             vpred_mean_abs.detach().cpu()
@@ -330,7 +362,6 @@ class ASR_Brain(sb.Brain):
             max_prob_mean.detach().cpu()
         )
 
-        # NEW (Change 4): flow-specific stats
         if p_flow is not None:
             flow_entropy = (
                 -(p_flow * p_flow.clamp_min(1e-8).log()).sum(dim=-1).mean()
@@ -368,7 +399,7 @@ class ASR_Brain(sb.Brain):
         return total ** 0.5
 
     # ------------------------------------------------------------------
-    # Forward pass (Change 2: flow integration at eval time)
+    # Forward pass
     # ------------------------------------------------------------------
 
     def compute_forward(self, batch, stage):
@@ -381,36 +412,34 @@ class ASR_Brain(sb.Brain):
         feats = self.hparams.compute_features(wavs)
         feats = self.modules.normalize(feats, wav_lens)
 
-        # Encoder forward pass: lines 5-8 of Algorithm 2
-        hidden = self.modules.model(feats)          # H = f_enc(X)
-        logits = self.modules.output(hidden)         # Z = f_proj(H)
-        alpha = self.logits_to_dirichlet(logits)     # A = softplus(Z) + eps
-        p0 = self.dirichlet_mean(alpha)              # p0 = A / sum(A)
+        # Encoder: lines 5-8 of Algorithm 2
+        hidden = self.modules.model(feats)
+        logits = self.modules.output(hidden)
+        alpha = self.logits_to_dirichlet(logits)
+        p0 = self.dirichlet_mean(alpha)
 
-        # Build frame-level targets: line 9 of Algorithm 2
+        # Frame targets: line 9
         frame_ids, frame_mask = self.build_frame_targets(
             batch, hidden, wav_lens
         )
         p1 = self.make_target_simplex(frame_ids)
 
-        # Sample flow time and compute bridge/velocity: lines 10-13
+        # Sample t, bridge, velocity: lines 10-13
         t = torch.rand(1, device=hidden.device).item()
-        pt = self.bridge_state(p0, p1, t)            # reference state at t
-        vt = self.target_velocity(p0, p1)            # reference velocity
-        vpred = self.modules.velocity_net(pt, t, hidden)  # predicted velocity
+        pt = self.bridge_state(p0, p1, t)
+        vt = self.target_velocity(p0, p1)
+        vpred = self.modules.velocity_net(pt, t, hidden)
 
-        # --- THIS IS THE KEY CHANGE (Change 2) ---
-        # During training: CTC uses p0 (fast, no integration needed)
-        # During validation/test: CTC uses the flow-evolved distribution
-        if stage == sb.Stage.TRAIN:
-            log_probs = torch.log(p0.clamp_min(1e-8))
-            p_flow = None
-        else:
-            # Integrate the velocity field from t=0 to t=1
+        # p0 log-probs for CTC loss and p0 PER metric
+        log_probs = torch.log(p0.clamp_min(1e-8))
+
+        # Flow integration only at eval time
+        if stage != sb.Stage.TRAIN:
             p_flow = self.integrate_flow(
                 p0, hidden, self.hparams.num_flow_steps
             )
-            log_probs = torch.log(p_flow.clamp_min(1e-8))
+        else:
+            p_flow = None
 
         return {
             "hidden": hidden,
@@ -424,13 +453,13 @@ class ASR_Brain(sb.Brain):
             "t": t,
             "frame_ids": frame_ids,
             "frame_mask": frame_mask,
-            "log_probs": log_probs,   # from p0 during train, from flow at eval
+            "log_probs": log_probs,
             "wav_lens": wav_lens,
-            "p_flow": p_flow,         # NEW: None during train, tensor at eval
+            "p_flow": p_flow,
         }
 
     # ------------------------------------------------------------------
-    # Objectives (Change 3: dual PER tracking)
+    # Objectives
     # ------------------------------------------------------------------
 
     def compute_objectives(self, predictions, batch, stage):
@@ -453,13 +482,12 @@ class ASR_Brain(sb.Brain):
             phns = self.hparams.wav_augment.replicate_labels(phns)
             phn_lens = self.hparams.wav_augment.replicate_labels(phn_lens)
 
-        # CTC loss: during training uses p0, during eval uses flow output
+        # CTC loss on p0 log-probs (always)
         ctc_loss = self.hparams.compute_cost(
             log_probs, phns, pout_lens, phn_lens
         )
 
-        # FM loss: always computed on the velocity prediction vs target
-        # This is Algorithm 2 line 13: L += ||v_hat - vt*||^2
+        # FM loss: Algorithm 2 line 13
         fm_sq = ((vpred - vt) ** 2).mean(dim=-1)
         fm_loss = (fm_sq * frame_mask).sum() / frame_mask.sum().clamp_min(1.0)
 
@@ -489,26 +517,26 @@ class ASR_Brain(sb.Brain):
         )
 
         if stage != sb.Stage.TRAIN:
-            # --- CHANGE 3: Decode from FLOW output (primary metric) ---
-            sequence_flow = sb.decoders.ctc_greedy_decode(
+            # ----- p0 PER: CTC greedy decode (implicit alignment) -----
+            sequence_p0 = sb.decoders.ctc_greedy_decode(
                 log_probs, pout_lens, blank_id=self.hparams.blank_index
             )
-            self.per_metrics_flow.append(
+            self.per_metrics_p0.append(
                 ids=batch.id,
-                predict=sequence_flow,
+                predict=sequence_p0,
                 target=phns,
                 target_len=phn_lens,
                 ind2lab=self.label_encoder.decode_ndim,
             )
 
-            # --- CHANGE 3: Also decode from p0 (comparison metric) ---
-            log_probs_p0 = torch.log(p0.clamp_min(1e-8))
-            sequence_p0 = sb.decoders.ctc_greedy_decode(
-                log_probs_p0, pout_lens, blank_id=self.hparams.blank_index
-            )
-            self.per_metrics_p0.append(
+            # ----- Flow PER: frame-aligned argmax+collapse (KEY FIX) -----
+            # Uses decode_flow_output instead of ctc_greedy_decode because
+            # the flow produces frame-level phoneme predictions with explicit
+            # alignment, not CTC-style blank-heavy implicit alignment.
+            sequence_flow = self.decode_flow_output(p_flow, pout_lens)
+            self.per_metrics_flow.append(
                 ids=batch.id,
-                predict=sequence_p0,
+                predict=sequence_flow,
                 target=phns,
                 target_len=phn_lens,
                 ind2lab=self.label_encoder.decode_ndim,
@@ -534,7 +562,7 @@ class ASR_Brain(sb.Brain):
         return total_loss
 
     # ------------------------------------------------------------------
-    # Training loop (unchanged from Stage 7)
+    # Training loop
     # ------------------------------------------------------------------
 
     def fit_batch(self, batch):
@@ -573,14 +601,13 @@ class ASR_Brain(sb.Brain):
         return loss.detach()
 
     # ------------------------------------------------------------------
-    # Stage callbacks (Change 3: dual PER metrics)
+    # Stage callbacks
     # ------------------------------------------------------------------
 
     def on_stage_start(self, stage, epoch):
         self.ctc_metrics = self.hparams.ctc_stats()
         self._init_monitor_sums()
         if stage != sb.Stage.TRAIN:
-            # NEW: two separate PER trackers
             self.per_metrics_flow = self.hparams.per_stats()
             self.per_metrics_p0 = self.hparams.per_stats()
 
@@ -591,29 +618,26 @@ class ASR_Brain(sb.Brain):
             self.train_loss = stage_loss
             self.train_monitor_stats = monitor_stats
         else:
-            # NEW: compute both PERs
             per_flow = self.per_metrics_flow.summarize("error_rate")
             per_p0 = self.per_metrics_p0.summarize("error_rate")
 
         if stage == sb.Stage.VALID:
-            # NEW (Change 5): LR scheduler uses flow PER since that is
-            # the actual system output we care about
-            old_lr, new_lr = self.hparams.lr_annealing(per_flow)
+            # Use p0 PER for LR scheduling and checkpointing (stable metric)
+            old_lr, new_lr = self.hparams.lr_annealing(per_p0)
             sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
 
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": old_lr},
                 train_stats=self.train_monitor_stats,
                 valid_stats={
-                    "PER": per_flow,       # flow-evolved PER (primary)
-                    "PER_p0": per_p0,      # raw encoder PER (comparison)
+                    "PER": per_flow,       # flow PER (argmax+collapse)
+                    "PER_p0": per_p0,      # p0 PER (CTC greedy)
                     **monitor_stats,
                 },
             )
 
-            # NEW (Change 5): checkpoint based on flow PER
             self.checkpointer.save_and_keep_only(
-                meta={"PER": per_flow},
+                meta={"PER": per_p0},
                 min_keys=["PER"],
             )
 
@@ -634,9 +658,9 @@ class ASR_Brain(sb.Brain):
                 ) as w:
                     w.write("CTC loss stats:\n")
                     self.ctc_metrics.write_stats(w)
-                    w.write("\nFlow PER stats:\n")
+                    w.write("\nFlow PER stats (argmax+collapse decode):\n")
                     self.per_metrics_flow.write_stats(w)
-                    w.write("\np0 PER stats (no flow):\n")
+                    w.write("\np0 PER stats (CTC greedy decode):\n")
                     self.per_metrics_p0.write_stats(w)
                     print(
                         "CTC and PER stats written to ",
@@ -645,7 +669,7 @@ class ASR_Brain(sb.Brain):
 
 
 # ======================================================================
-# Data pipeline (unchanged from Stage 7)
+# Data pipeline
 # ======================================================================
 
 
