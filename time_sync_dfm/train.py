@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
-"""Stage 7: CTC ASR on TIMIT with trainable flow-matching loss.
+"""Stage 8: CTC ASR on TIMIT with proper Dirichlet Flow Matching.
 
-Adds:
-- learned velocity network v_theta(pt, t, H)
-- target velocity vt* = p1 - p0
-- FM loss = ||vpred - vt||^2
-- total loss = lambda_ctc * ctc_loss + lambda_fm * fm_loss
+Changes from Stage 7:
+---------------------
+1. Added integrate_flow() - Euler ODE integration of the learned velocity field
+   from t=0 to t=1. This is the missing piece that turns the velocity network
+   from a side loss into an actual generative flow that produces predictions.
+
+2. Modified compute_forward() - During validation/test, the model now integrates
+   the flow and decodes from the flow-evolved distribution instead of raw p0.
+   During training, CTC still uses p0 for speed (FM loss still trains velocity net).
+
+3. Added dual PER tracking - At validation, both p0 PER and flow PER are computed
+   and logged. This lets you directly compare whether the flow improves predictions
+   over the raw encoder output.
+
+4. Added flow monitoring stats - flow_entropy and flow_p0_delta track how much
+   the flow changes the distribution during integration.
+
+5. LR scheduler now uses flow PER - The learning rate and checkpoint selection
+   are based on the flow-evolved PER, since that is the actual system output.
+
+Algorithm reference (from dissertation Algorithm 2):
+  Training: sample t, build bridge pt* = (1-t)p0 + tp1, compute target velocity
+            vt* = p1-p0, predict v_hat = v_theta(pt*, t, H), loss = ||v_hat - vt*||^2
+  Inference: start from p0, integrate dp/dt = v_theta(p, t, H) from t=0 to t=1
+             using Euler steps, decode from the resulting p_final
 """
 
 import os
@@ -24,6 +44,14 @@ logger = get_logger(__name__)
 
 
 class VelocityNet(nn.Module):
+    """Predicts the velocity field v_theta(p_t, t, H).
+
+    Takes the current simplex state p_t, the scalar flow time t, and the
+    encoder hidden states H, and outputs a velocity vector for each frame.
+    The output is zero-mean across the vocab dimension so it preserves the
+    simplex constraint (probabilities sum to 1) during integration.
+    """
+
     def __init__(self, vocab_size, hidden_size, velocity_hidden=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -43,26 +71,87 @@ class VelocityNet(nn.Module):
         )
         inp = torch.cat([pt, hidden, t_tensor], dim=-1)
         v = self.net(inp)
+        # Zero-mean constraint: velocity should not change the sum of
+        # probabilities, so we subtract the mean across the vocab dimension.
         v = v - v.mean(dim=-1, keepdim=True)
         return v
 
 
 class ASR_Brain(sb.Brain):
+
+    # ------------------------------------------------------------------
+    # Dirichlet parametrisation helpers (unchanged from Stage 7)
+    # ------------------------------------------------------------------
+
     def logits_to_dirichlet(self, logits):
+        """Convert raw logits to positive Dirichlet concentration parameters.
+        Matches Algorithm 2 line 7: A = softplus(Z) + epsilon."""
         return F.softplus(logits) + self.hparams.dfm_epsilon
 
     def dirichlet_mean(self, alpha):
+        """Compute the Dirichlet mean (Option A from Algorithm 2 line 8).
+        p0 = alpha / sum(alpha) for each frame."""
         return alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(
             self.hparams.dfm_epsilon
         )
 
+    # ------------------------------------------------------------------
+    # Bridge and velocity (unchanged from Stage 7)
+    # ------------------------------------------------------------------
+
     def bridge_state(self, p0, p1, t):
+        """Simplex linear bridge: phi_t(p0, p1) = (1-t)*p0 + t*p1.
+        Matches Algorithm 2 line 10 with the linear bridge choice."""
         return (1.0 - t) * p0 + t * p1
 
     def target_velocity(self, p0, p1):
+        """Analytic derivative of the linear bridge: d/dt phi_t = p1 - p0.
+        Matches Algorithm 2 line 11. This is constant for all t."""
         return p1 - p0
 
+    # ------------------------------------------------------------------
+    # NEW: ODE integration for inference (Change 1)
+    # ------------------------------------------------------------------
+
+    def integrate_flow(self, p0, hidden, num_steps):
+        """Euler integration of the learned velocity field from t=0 to t=1.
+
+        This is the inference procedure that makes the velocity network
+        actually produce predictions. At each step:
+          p(t + dt) = p(t) + dt * v_theta(p(t), t, H)
+        then project back onto the simplex (clamp + renormalise).
+
+        Args:
+            p0: Initial simplex state [B, T, V] from Dirichlet mean
+            hidden: Encoder hidden states [B, T, D] for conditioning
+            num_steps: Number of Euler steps (more = more accurate but slower)
+
+        Returns:
+            p_final: Flow-evolved distribution [B, T, V] on the simplex
+        """
+        dt = 1.0 / num_steps
+        p = p0.clone()
+        t = 0.0
+        for step in range(num_steps):
+            v = self.modules.velocity_net(p, t, hidden)
+            p = p + dt * v
+            # Project back onto the simplex after each step.
+            # Without this, numerical drift causes values to go negative
+            # or not sum to 1, which breaks the probability interpretation.
+            p = p.clamp_min(self.hparams.dfm_epsilon)
+            p = p / p.sum(dim=-1, keepdim=True).clamp_min(
+                self.hparams.dfm_epsilon
+            )
+            t += dt
+        return p
+
+    # ------------------------------------------------------------------
+    # Frame-level target construction (unchanged from Stage 7)
+    # ------------------------------------------------------------------
+
     def build_frame_targets(self, batch, hidden, wav_lens):
+        """Map phoneme-level labels to frame-level targets using TIMIT boundaries.
+        Matches Algorithm 2 line 9: p1 = AlignToFrames(y, H)."""
         device = hidden.device
         B, T_enc = hidden.size(0), hidden.size(1)
 
@@ -77,7 +166,9 @@ class ASR_Brain(sb.Brain):
         max_wav_len = batch.sig[0].size(1)
 
         for b in range(B):
-            valid_samples = int(round(float(wav_lens[b].detach().cpu()) * max_wav_len))
+            valid_samples = int(
+                round(float(wav_lens[b].detach().cpu()) * max_wav_len)
+            )
             valid_samples = max(valid_samples, 1)
 
             phns = batch.phn_list[b]
@@ -102,12 +193,17 @@ class ASR_Brain(sb.Brain):
         return frame_ids, frame_mask
 
     def make_target_simplex(self, frame_ids):
+        """Convert frame-level phoneme IDs to smoothed one-hot target distributions."""
         p1 = F.one_hot(
             frame_ids, num_classes=self.hparams.output_neurons
         ).float()
         smooth = self.hparams.target_smoothing
         p1 = (1.0 - smooth) * p1 + smooth / self.hparams.output_neurons
         return p1
+
+    # ------------------------------------------------------------------
+    # Monitoring helpers
+    # ------------------------------------------------------------------
 
     def _init_monitor_sums(self):
         self.monitor_sums = {
@@ -139,6 +235,9 @@ class ASR_Brain(sb.Brain):
             "t_mean": 0.0,
             "blank_prob_mean": 0.0,
             "max_prob_mean": 0.0,
+            # NEW (Change 4): flow-specific monitoring
+            "flow_entropy": 0.0,
+            "flow_p0_delta": 0.0,
             "num_batches": 0,
         }
 
@@ -157,11 +256,14 @@ class ASR_Brain(sb.Brain):
         t_value,
         log_probs,
         grad_norm=None,
+        # NEW (Change 4): optional flow stats
+        p_flow=None,
     ):
         probs = log_probs.exp()
         p0_entropy = -(p0 * p0.clamp_min(1e-8).log()).sum(dim=-1).mean()
         p1_entropy = -(p1 * p1.clamp_min(1e-8).log()).sum(dim=-1).mean()
         pt_entropy = -(pt * pt.clamp_min(1e-8).log()).sum(dim=-1).mean()
+
         blank_prob_mean = probs[..., self.hparams.blank_index].mean()
         max_prob_mean = probs.max(dim=-1).values.mean()
 
@@ -206,17 +308,40 @@ class ASR_Brain(sb.Brain):
         self.monitor_sums["vt_l2"] += float(vt_l2.detach().cpu())
         self.monitor_sums["vt_sum_mean"] += float(vt_sum_mean.detach().cpu())
 
-        self.monitor_sums["vpred_mean_abs"] += float(vpred_mean_abs.detach().cpu())
+        self.monitor_sums["vpred_mean_abs"] += float(
+            vpred_mean_abs.detach().cpu()
+        )
         self.monitor_sums["vpred_l2"] += float(vpred_l2.detach().cpu())
-        self.monitor_sums["vpred_sum_mean"] += float(vpred_sum_mean.detach().cpu())
+        self.monitor_sums["vpred_sum_mean"] += float(
+            vpred_sum_mean.detach().cpu()
+        )
         self.monitor_sums["velocity_mse_monitor"] += float(
             velocity_mse_monitor.detach().cpu()
         )
-        self.monitor_sums["velocity_cosine_monitor"] += float(cos.detach().cpu())
+        self.monitor_sums["velocity_cosine_monitor"] += float(
+            cos.detach().cpu()
+        )
 
         self.monitor_sums["t_mean"] += float(t_value)
-        self.monitor_sums["blank_prob_mean"] += float(blank_prob_mean.detach().cpu())
-        self.monitor_sums["max_prob_mean"] += float(max_prob_mean.detach().cpu())
+        self.monitor_sums["blank_prob_mean"] += float(
+            blank_prob_mean.detach().cpu()
+        )
+        self.monitor_sums["max_prob_mean"] += float(
+            max_prob_mean.detach().cpu()
+        )
+
+        # NEW (Change 4): flow-specific stats
+        if p_flow is not None:
+            flow_entropy = (
+                -(p_flow * p_flow.clamp_min(1e-8).log()).sum(dim=-1).mean()
+            )
+            flow_p0_delta = (p_flow - p0).abs().mean()
+            self.monitor_sums["flow_entropy"] += float(
+                flow_entropy.detach().cpu()
+            )
+            self.monitor_sums["flow_p0_delta"] += float(
+                flow_p0_delta.detach().cpu()
+            )
 
         if grad_norm is not None:
             self.monitor_sums["grad_norm"] += float(grad_norm)
@@ -225,7 +350,11 @@ class ASR_Brain(sb.Brain):
 
     def _get_monitor_averages(self):
         n = max(self.monitor_sums["num_batches"], 1)
-        return {k: (v / n if k != "num_batches" else v) for k, v in self.monitor_sums.items() if k != "num_batches"}
+        return {
+            k: (v / n if k != "num_batches" else v)
+            for k, v in self.monitor_sums.items()
+            if k != "num_batches"
+        }
 
     def _get_grad_norm(self):
         total = 0.0
@@ -238,6 +367,10 @@ class ASR_Brain(sb.Brain):
             return None
         return total ** 0.5
 
+    # ------------------------------------------------------------------
+    # Forward pass (Change 2: flow integration at eval time)
+    # ------------------------------------------------------------------
+
     def compute_forward(self, batch, stage):
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
@@ -248,20 +381,36 @@ class ASR_Brain(sb.Brain):
         feats = self.hparams.compute_features(wavs)
         feats = self.modules.normalize(feats, wav_lens)
 
-        hidden = self.modules.model(feats)
-        logits = self.modules.output(hidden)
-        alpha = self.logits_to_dirichlet(logits)
-        p0 = self.dirichlet_mean(alpha)
+        # Encoder forward pass: lines 5-8 of Algorithm 2
+        hidden = self.modules.model(feats)          # H = f_enc(X)
+        logits = self.modules.output(hidden)         # Z = f_proj(H)
+        alpha = self.logits_to_dirichlet(logits)     # A = softplus(Z) + eps
+        p0 = self.dirichlet_mean(alpha)              # p0 = A / sum(A)
 
-        frame_ids, frame_mask = self.build_frame_targets(batch, hidden, wav_lens)
+        # Build frame-level targets: line 9 of Algorithm 2
+        frame_ids, frame_mask = self.build_frame_targets(
+            batch, hidden, wav_lens
+        )
         p1 = self.make_target_simplex(frame_ids)
 
+        # Sample flow time and compute bridge/velocity: lines 10-13
         t = torch.rand(1, device=hidden.device).item()
-        pt = self.bridge_state(p0, p1, t)
-        vt = self.target_velocity(p0, p1)
-        vpred = self.modules.velocity_net(pt, t, hidden)
+        pt = self.bridge_state(p0, p1, t)            # reference state at t
+        vt = self.target_velocity(p0, p1)            # reference velocity
+        vpred = self.modules.velocity_net(pt, t, hidden)  # predicted velocity
 
-        log_probs = torch.log(p0.clamp_min(1e-8))
+        # --- THIS IS THE KEY CHANGE (Change 2) ---
+        # During training: CTC uses p0 (fast, no integration needed)
+        # During validation/test: CTC uses the flow-evolved distribution
+        if stage == sb.Stage.TRAIN:
+            log_probs = torch.log(p0.clamp_min(1e-8))
+            p_flow = None
+        else:
+            # Integrate the velocity field from t=0 to t=1
+            p_flow = self.integrate_flow(
+                p0, hidden, self.hparams.num_flow_steps
+            )
+            log_probs = torch.log(p_flow.clamp_min(1e-8))
 
         return {
             "hidden": hidden,
@@ -275,9 +424,14 @@ class ASR_Brain(sb.Brain):
             "t": t,
             "frame_ids": frame_ids,
             "frame_mask": frame_mask,
-            "log_probs": log_probs,
+            "log_probs": log_probs,   # from p0 during train, from flow at eval
             "wav_lens": wav_lens,
+            "p_flow": p_flow,         # NEW: None during train, tensor at eval
         }
+
+    # ------------------------------------------------------------------
+    # Objectives (Change 3: dual PER tracking)
+    # ------------------------------------------------------------------
 
     def compute_objectives(self, predictions, batch, stage):
         log_probs = predictions["log_probs"]
@@ -291,6 +445,7 @@ class ASR_Brain(sb.Brain):
         t = predictions["t"]
         frame_mask = predictions["frame_mask"]
         pout_lens = predictions["wav_lens"]
+        p_flow = predictions["p_flow"]
 
         phns, phn_lens = batch.phn_encoded
 
@@ -298,8 +453,13 @@ class ASR_Brain(sb.Brain):
             phns = self.hparams.wav_augment.replicate_labels(phns)
             phn_lens = self.hparams.wav_augment.replicate_labels(phn_lens)
 
-        ctc_loss = self.hparams.compute_cost(log_probs, phns, pout_lens, phn_lens)
+        # CTC loss: during training uses p0, during eval uses flow output
+        ctc_loss = self.hparams.compute_cost(
+            log_probs, phns, pout_lens, phn_lens
+        )
 
+        # FM loss: always computed on the velocity prediction vs target
+        # This is Algorithm 2 line 13: L += ||v_hat - vt*||^2
         fm_sq = ((vpred - vt) ** 2).mean(dim=-1)
         fm_loss = (fm_sq * frame_mask).sum() / frame_mask.sum().clamp_min(1.0)
 
@@ -321,17 +481,34 @@ class ASR_Brain(sb.Brain):
             "vpred": vpred.detach(),
             "t": t,
             "log_probs": log_probs.detach(),
+            "p_flow": p_flow.detach() if p_flow is not None else None,
         }
 
-        self.ctc_metrics.append(batch.id, log_probs, phns, pout_lens, phn_lens)
+        self.ctc_metrics.append(
+            batch.id, log_probs, phns, pout_lens, phn_lens
+        )
 
         if stage != sb.Stage.TRAIN:
-            sequence = sb.decoders.ctc_greedy_decode(
+            # --- CHANGE 3: Decode from FLOW output (primary metric) ---
+            sequence_flow = sb.decoders.ctc_greedy_decode(
                 log_probs, pout_lens, blank_id=self.hparams.blank_index
             )
-            self.per_metrics.append(
+            self.per_metrics_flow.append(
                 ids=batch.id,
-                predict=sequence,
+                predict=sequence_flow,
+                target=phns,
+                target_len=phn_lens,
+                ind2lab=self.label_encoder.decode_ndim,
+            )
+
+            # --- CHANGE 3: Also decode from p0 (comparison metric) ---
+            log_probs_p0 = torch.log(p0.clamp_min(1e-8))
+            sequence_p0 = sb.decoders.ctc_greedy_decode(
+                log_probs_p0, pout_lens, blank_id=self.hparams.blank_index
+            )
+            self.per_metrics_p0.append(
+                ids=batch.id,
+                predict=sequence_p0,
                 target=phns,
                 target_len=phn_lens,
                 ind2lab=self.label_encoder.decode_ndim,
@@ -351,9 +528,14 @@ class ASR_Brain(sb.Brain):
                 t_value=t,
                 log_probs=log_probs,
                 grad_norm=None,
+                p_flow=p_flow,
             )
 
         return total_loss
+
+    # ------------------------------------------------------------------
+    # Training loop (unchanged from Stage 7)
+    # ------------------------------------------------------------------
 
     def fit_batch(self, batch):
         predictions = self.compute_forward(batch, sb.Stage.TRAIN)
@@ -378,6 +560,7 @@ class ASR_Brain(sb.Brain):
             t_value=self.current_batch_stats["t"],
             log_probs=self.current_batch_stats["log_probs"],
             grad_norm=grad_norm,
+            p_flow=self.current_batch_stats["p_flow"],
         )
 
         self.optimizer.step()
@@ -389,11 +572,17 @@ class ASR_Brain(sb.Brain):
             loss = self.compute_objectives(predictions, batch, stage=stage)
         return loss.detach()
 
+    # ------------------------------------------------------------------
+    # Stage callbacks (Change 3: dual PER metrics)
+    # ------------------------------------------------------------------
+
     def on_stage_start(self, stage, epoch):
         self.ctc_metrics = self.hparams.ctc_stats()
         self._init_monitor_sums()
         if stage != sb.Stage.TRAIN:
-            self.per_metrics = self.hparams.per_stats()
+            # NEW: two separate PER trackers
+            self.per_metrics_flow = self.hparams.per_stats()
+            self.per_metrics_p0 = self.hparams.per_stats()
 
     def on_stage_end(self, stage, stage_loss, epoch):
         monitor_stats = self._get_monitor_averages()
@@ -402,39 +591,67 @@ class ASR_Brain(sb.Brain):
             self.train_loss = stage_loss
             self.train_monitor_stats = monitor_stats
         else:
-            per = self.per_metrics.summarize("error_rate")
+            # NEW: compute both PERs
+            per_flow = self.per_metrics_flow.summarize("error_rate")
+            per_p0 = self.per_metrics_p0.summarize("error_rate")
 
         if stage == sb.Stage.VALID:
-            old_lr, new_lr = self.hparams.lr_annealing(per)
+            # NEW (Change 5): LR scheduler uses flow PER since that is
+            # the actual system output we care about
+            old_lr, new_lr = self.hparams.lr_annealing(per_flow)
             sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
 
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": old_lr},
                 train_stats=self.train_monitor_stats,
-                valid_stats={"PER": per, **monitor_stats},
+                valid_stats={
+                    "PER": per_flow,       # flow-evolved PER (primary)
+                    "PER_p0": per_p0,      # raw encoder PER (comparison)
+                    **monitor_stats,
+                },
             )
 
+            # NEW (Change 5): checkpoint based on flow PER
             self.checkpointer.save_and_keep_only(
-                meta={"PER": per},
+                meta={"PER": per_flow},
                 min_keys=["PER"],
             )
 
         elif stage == sb.Stage.TEST:
             self.hparams.train_logger.log_stats(
-                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats={"PER": per, **monitor_stats},
+                stats_meta={
+                    "Epoch loaded": self.hparams.epoch_counter.current
+                },
+                test_stats={
+                    "loss": stage_loss,
+                    "PER": per_flow,
+                    "PER_p0": per_p0,
+                },
             )
-
             if if_main_process():
-                with open(self.hparams.test_wer_file, "w", encoding="utf-8") as w:
+                with open(
+                    self.hparams.test_wer_file, "w", encoding="utf-8"
+                ) as w:
                     w.write("CTC loss stats:\n")
                     self.ctc_metrics.write_stats(w)
-                    w.write("\nPER stats:\n")
-                    self.per_metrics.write_stats(w)
-                    print("CTC and PER stats written to ", self.hparams.test_wer_file)
+                    w.write("\nFlow PER stats:\n")
+                    self.per_metrics_flow.write_stats(w)
+                    w.write("\np0 PER stats (no flow):\n")
+                    self.per_metrics_p0.write_stats(w)
+                    print(
+                        "CTC and PER stats written to ",
+                        self.hparams.test_wer_file,
+                    )
+
+
+# ======================================================================
+# Data pipeline (unchanged from Stage 7)
+# ======================================================================
 
 
 def dataio_prep(hparams):
+    """Creates the datasets and their data processing pipelines."""
+
     data_folder = hparams["data_folder"]
 
     train_data = sb.dataio.dataset.DynamicItemDataset.from_json(
@@ -446,22 +663,28 @@ def dataio_prep(hparams):
         train_data = train_data.filtered_sorted(sort_key="duration")
         hparams["train_dataloader_opts"]["shuffle"] = False
     elif hparams["sorting"] == "descending":
-        train_data = train_data.filtered_sorted(sort_key="duration", reverse=True)
+        train_data = train_data.filtered_sorted(
+            sort_key="duration", reverse=True
+        )
         hparams["train_dataloader_opts"]["shuffle"] = False
     elif hparams["sorting"] == "random":
         pass
     else:
-        raise NotImplementedError("sorting must be random, ascending or descending")
+        raise NotImplementedError(
+            "sorting must be random, ascending or descending"
+        )
 
     valid_data = sb.dataio.dataset.DynamicItemDataset.from_json(
         json_path=hparams["valid_annotation"],
         replacements={"data_root": data_folder},
-    ).filtered_sorted(sort_key="duration")
+    )
+    valid_data = valid_data.filtered_sorted(sort_key="duration")
 
     test_data = sb.dataio.dataset.DynamicItemDataset.from_json(
         json_path=hparams["test_annotation"],
         replacements={"data_root": data_folder},
-    ).filtered_sorted(sort_key="duration")
+    )
+    test_data = test_data.filtered_sorted(sort_key="duration")
 
     datasets = [train_data, valid_data, test_data]
     label_encoder = sb.dataio.encoder.CTCTextEncoder()
@@ -469,12 +692,15 @@ def dataio_prep(hparams):
     @sb.utils.data_pipeline.takes("wav")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
-        return sb.dataio.dataio.read_audio(wav)
+        sig = sb.dataio.dataio.read_audio(wav)
+        return sig
 
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline)
 
     @sb.utils.data_pipeline.takes("phn", "ground_truth_phn_ends")
-    @sb.utils.data_pipeline.provides("phn_list", "phn_encoded", "phn_end_list")
+    @sb.utils.data_pipeline.provides(
+        "phn_list", "phn_encoded", "phn_end_list"
+    )
     def text_pipeline(phn, ground_truth_phn_ends):
         phn_list = phn.strip().split()
         yield phn_list

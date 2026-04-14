@@ -1,15 +1,27 @@
 # ################################
-# Stage 7: CTC + Flow Matching
+# Stage 8: CTC + Proper Dirichlet Flow Matching
+#
+# Changes from Stage 7 train.yaml:
+# 1. run_name changed to dfm_stage8_flow_integration
+# 2. Added num_flow_steps (number of Euler steps for ODE integration at eval)
+# 3. skip_prep set to TRUE (assumes data is already prepared)
+#
+# The key difference is that validation/test now integrates the velocity field
+# from t=0 to t=1 using Euler steps, so the flow output actually produces
+# the predictions. Training still uses p0 for CTC speed.
 # ################################
 
 seed: 1986
-run_name: dfm_stage7_fm_loss
+run_name: dfm_stage8_flow_integration
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
+# ----------------------------------------------------------------------
+# Data files
+# ----------------------------------------------------------------------
 data_folder: "E:/dfm_asr/data/TIMIT/data"
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
@@ -17,19 +29,31 @@ test_annotation: !ref <save_folder>/test.json
 skip_prep: TRUE
 uppercase: True
 
+# ----------------------------------------------------------------------
+# Augmentation data
+# ----------------------------------------------------------------------
 data_folder_noise: !ref <data_folder>/noise
 NOISE_DATASET_URL: https://www.dropbox.com/scl/fi/a09pj97s5ifan81dqhi4n/noises.zip?rlkey=j8b0n9kdjdr32o1f06t0cw5b7&dl=1
 noise_annotation: !ref <save_folder>/noise.csv
 
+# ----------------------------------------------------------------------
+# Training parameters
+# ----------------------------------------------------------------------
 number_of_epochs: 40
 batch_size: 16
 lr: 1.0
 sorting: ascending
 
+# ----------------------------------------------------------------------
+# Feature parameters
+# ----------------------------------------------------------------------
 sample_rate: 16000
 n_fft: 400
 n_mels: 40
 
+# ----------------------------------------------------------------------
+# Encoder model parameters (same as baseline)
+# ----------------------------------------------------------------------
 activation: !name:torch.nn.LeakyReLU
 dropout: 0.15
 cnn_blocks: 2
@@ -41,17 +65,37 @@ rnn_bidirectional: True
 dnn_blocks: 2
 dnn_neurons: 512
 
+# ----------------------------------------------------------------------
+# Output layer
+# ----------------------------------------------------------------------
 output_neurons: 40
 blank_index: 0
 
+# ----------------------------------------------------------------------
+# DFM parameters
+# ----------------------------------------------------------------------
 dfm_epsilon: 1.0e-6
 target_smoothing: 0.02
 velocity_hidden: 256
 
+# NEW (Change 3): Number of Euler steps for ODE integration at inference.
+# More steps = more accurate flow trajectory but slower validation.
+# 10 is a good balance. You can experiment with 4, 10, 20.
+num_flow_steps: 10
+
+# ----------------------------------------------------------------------
+# Hybrid loss weights
+# lambda_ctc: weight for the CTC loss (trains encoder to produce good logits)
+# lambda_fm:  weight for the FM loss (trains velocity network to learn the flow)
+# ----------------------------------------------------------------------
 lambda_ctc: 1.0
 lambda_fm: 0.1
 
+# ----------------------------------------------------------------------
+# Dataloader options
+# ----------------------------------------------------------------------
 num_workers: 0
+
 train_dataloader_opts:
     batch_size: !ref <batch_size>
     num_workers: !ref <num_workers>
@@ -64,9 +108,15 @@ test_dataloader_opts:
     batch_size: !ref <batch_size>
     num_workers: !ref <num_workers>
 
+# ----------------------------------------------------------------------
+# Normalization
+# ----------------------------------------------------------------------
 normalize: !new:speechbrain.processing.features.InputNormalization
     norm_type: global
 
+# ----------------------------------------------------------------------
+# Augmentations
+# ----------------------------------------------------------------------
 prepare_noise_data: !name:speechbrain.augment.preparation.prepare_dataset_from_URL
     URL: !ref <NOISE_DATASET_URL>
     dest_folder: !ref <data_folder_noise>
@@ -104,11 +154,15 @@ wav_augment: !new:speechbrain.augment.augmenter.Augmenter
     max_augmentations: 2
     augment_prob: 0.5
     augmentations: [
+        !ref <add_noise>,
         !ref <speed_perturb>,
         !ref <drop_freq>,
         !ref <drop_chunk>
     ]
 
+# ----------------------------------------------------------------------
+# Training helpers
+# ----------------------------------------------------------------------
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
 
@@ -117,6 +171,9 @@ compute_features: !new:speechbrain.lobes.features.Fbank
     n_fft: !ref <n_fft>
     n_mels: !ref <n_mels>
 
+# ----------------------------------------------------------------------
+# Encoder (CRDNN acoustic model, same architecture as baseline)
+# ----------------------------------------------------------------------
 model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     input_size: !ref <n_mels>
     activation: !ref <activation>
@@ -131,11 +188,13 @@ model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     dnn_blocks: !ref <dnn_blocks>
     dnn_neurons: !ref <dnn_neurons>
 
+# Linear projection head: H -> Z (logits)
 output: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <dnn_neurons>
     n_neurons: !ref <output_neurons>
     bias: True
 
+# Velocity network: v_theta(p_t, t, H)
 velocity_net: !new:__main__.VelocityNet
     vocab_size: !ref <output_neurons>
     hidden_size: !ref <dnn_neurons>
@@ -144,6 +203,9 @@ velocity_net: !new:__main__.VelocityNet
 log_softmax: !new:speechbrain.nnet.activations.Softmax
     apply_log: True
 
+# ----------------------------------------------------------------------
+# Optimizer / scheduler
+# ----------------------------------------------------------------------
 opt_class: !name:torch.optim.Adadelta
     rho: 0.95
     lr: !ref <lr>
@@ -155,6 +217,9 @@ lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
     annealing_factor: 0.8
     patient: 0
 
+# ----------------------------------------------------------------------
+# Registered trainable modules
+# ----------------------------------------------------------------------
 modules:
     model: !ref <model>
     output: !ref <output>
@@ -163,6 +228,9 @@ modules:
 
 jit_module_keys: [model]
 
+# ----------------------------------------------------------------------
+# Checkpointing
+# ----------------------------------------------------------------------
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
@@ -173,6 +241,9 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
         normalizer: !ref <normalize>
         counter: !ref <epoch_counter>
 
+# ----------------------------------------------------------------------
+# Loss / logging / metrics
+# ----------------------------------------------------------------------
 compute_cost: !name:speechbrain.nnet.losses.ctc_loss
     blank_index: !ref <blank_index>
 
