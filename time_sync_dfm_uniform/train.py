@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""Stage 8b: CTC ASR on TIMIT with proper Dirichlet Flow Matching.
+"""Stage 9: CTC ASR on TIMIT with Uniform-Start Dirichlet Flow Matching.
 
-Changes from Stage 8:
----------------------
-KEY FIX: Flow decoding now uses frame-aligned argmax + collapse, NOT CTC
-greedy decode. The flow is trained to match frame-level phoneme targets from
-AlignToFrames, so its output already has explicit time alignment. CTC greedy
-decode fails because it expects blank-heavy output for implicit alignment.
+Changes from Stage 8b (p0-start version):
+------------------------------------------
+KEY CHANGE: The flow now starts from a UNIFORM distribution (1/K for all
+classes) instead of the encoder's p0 output. This means:
 
-The two decoding strategies compared:
-  - p0 path:   CTC greedy decode (implicit alignment via blanks)
-  - flow path: argmax per frame -> collapse consecutive duplicates -> remove
-               blanks (explicit alignment from AlignToFrames + learned flow)
+  - The bridge path is: pt = (1-t) * uniform + t * p1
+  - The target velocity is: vt = p1 - uniform  (constant, since uniform is fixed)
+  - At inference, ODE integration starts from uniform, NOT from p0
 
-Also changed: LR scheduling and checkpointing use p0 PER (stable CTC metric)
-so that the learning rate is not destabilised by early-epoch flow noise.
+The CTC loss path is UNCHANGED: the encoder still produces p0 via the
+Dirichlet parametrisation, and CTC loss is computed on log(p0). This keeps
+the encoder training stable. The only difference is that the flow matching
+branch no longer uses p0 as its starting point.
 
-Algorithm reference (Algorithm 2 from dissertation):
-  Training: sample t, build bridge pt* = (1-t)p0 + tp1, compute target velocity
-            vt* = p1-p0, predict v_hat = v_theta(pt*, t, H), loss = ||v_hat - vt*||^2
-  Inference: start from p0, integrate dp/dt = v_theta(p, t, H) from t=0 to t=1
-             using Euler steps, decode from the resulting p_final using argmax+collapse
+WHY: Starting from uniform makes the flow's task harder because it receives
+no initial information from the encoder via p0. The velocity network must
+rely entirely on the hidden states H (encoder conditioning) to learn the
+correct trajectory. This provides a second comparison point alongside the
+p0-start version, letting us evaluate how much the flow depends on having
+a good initial distribution vs. how much it can reconstruct from the
+encoder's hidden representations alone.
+
+Algorithm reference (modified from Algorithm 2):
+  Training: sample t, build bridge pt* = (1-t)*uniform + t*p1,
+            compute target velocity vt* = p1 - uniform,
+            predict v_hat = v_theta(pt*, t, H),
+            loss = ||v_hat - vt*||^2
+  Inference: start from uniform, integrate dp/dt = v_theta(p, t, H)
+             from t=0 to t=1 using Euler steps, decode from p_final
+             using argmax+collapse
 """
 
 import os
@@ -73,7 +83,7 @@ class VelocityNet(nn.Module):
 class ASR_Brain(sb.Brain):
 
     # ------------------------------------------------------------------
-    # Dirichlet parametrisation helpers
+    # Dirichlet parametrisation helpers (unchanged, still needed for CTC)
     # ------------------------------------------------------------------
 
     def logits_to_dirichlet(self, logits):
@@ -87,29 +97,67 @@ class ASR_Brain(sb.Brain):
         )
 
     # ------------------------------------------------------------------
-    # Bridge and velocity
+    # NEW: Uniform distribution constructor
     # ------------------------------------------------------------------
 
-    def bridge_state(self, p0, p1, t):
-        """Algorithm 2 line 10: linear bridge phi_t = (1-t)*p0 + t*p1."""
-        return (1.0 - t) * p0 + t * p1
+    def make_uniform(self, reference_tensor):
+        """Create a uniform distribution 1/K matching the shape of p0.
 
-    def target_velocity(self, p0, p1):
-        """Algorithm 2 line 11: d/dt phi_t = p1 - p0 (constant for linear bridge)."""
-        return p1 - p0
+        This is the key change from the p0-start version. Instead of
+        starting the flow from the encoder's informed distribution,
+        we start from a completely uninformed uniform distribution.
+        Every phoneme class gets equal probability 1/K.
+
+        Args:
+            reference_tensor: a tensor of shape [B, T, K] (same shape as p0)
+                              used only to determine batch size, sequence
+                              length, vocab size, device, and dtype.
+
+        Returns:
+            uniform: tensor of shape [B, T, K] where every entry is 1/K.
+        """
+        K = reference_tensor.size(-1)  # vocab size (output_neurons = 40)
+        return torch.full_like(reference_tensor, 1.0 / K)
 
     # ------------------------------------------------------------------
-    # ODE integration for inference
+    # Bridge and velocity (CHANGED: uses uniform instead of p0)
     # ------------------------------------------------------------------
 
-    def integrate_flow(self, p0, hidden, num_steps):
+    def bridge_state(self, p_start, p1, t):
+        """Linear bridge from p_start to p1.
+
+        In the p0 version:      pt = (1-t)*p0 + t*p1
+        In this uniform version: pt = (1-t)*uniform + t*p1
+
+        The p_start argument is now the uniform distribution, not p0.
+        """
+        return (1.0 - t) * p_start + t * p1
+
+    def target_velocity(self, p_start, p1):
+        """Target velocity d/dt bridge = p1 - p_start.
+
+        In the p0 version:      vt = p1 - p0       (varies per sample)
+        In this uniform version: vt = p1 - uniform  (uniform is the same
+                                                      for all samples, so
+                                                      the velocity is driven
+                                                      entirely by p1)
+        """
+        return p1 - p_start
+
+    # ------------------------------------------------------------------
+    # ODE integration for inference (CHANGED: starts from uniform)
+    # ------------------------------------------------------------------
+
+    def integrate_flow(self, p_start, hidden, num_steps):
         """Euler integration of the learned velocity field from t=0 to t=1.
+
+        CHANGED: p_start is now the uniform distribution, not p0.
 
         At each step: p(t + dt) = p(t) + dt * v_theta(p(t), t, H)
         then project back onto the simplex (clamp + renormalise).
         """
         dt = 1.0 / num_steps
-        p = p0.clone()
+        p = p_start.clone()
         t = 0.0
         for step in range(num_steps):
             v = self.modules.velocity_net(p, t, hidden)
@@ -122,7 +170,7 @@ class ASR_Brain(sb.Brain):
         return p
 
     # ------------------------------------------------------------------
-    # Flow decoding: frame-aligned argmax + collapse (KEY CHANGE)
+    # Flow decoding: frame-aligned argmax + collapse (unchanged)
     # ------------------------------------------------------------------
 
     def decode_flow_output(self, p_flow, pout_lens):
@@ -136,9 +184,6 @@ class ASR_Brain(sb.Brain):
           1. argmax at each frame -> most likely phoneme per frame
           2. Collapse consecutive duplicate predictions
           3. Remove blank tokens from the collapsed sequence
-
-        This is analogous to how you would read off phonemes from a
-        forced-alignment output, not how you would decode CTC.
         """
         frame_preds = p_flow.argmax(dim=-1)  # [B, T]
         B, T = frame_preds.size()
@@ -150,7 +195,6 @@ class ASR_Brain(sb.Brain):
             raw = frame_preds[b, :length].tolist()
 
             # Collapse consecutive duplicates
-            # e.g. [sil, sil, aa, aa, aa, sil, b, b] -> [sil, aa, sil, b]
             collapsed = []
             prev = None
             for idx in raw:
@@ -168,7 +212,7 @@ class ASR_Brain(sb.Brain):
         return sequences
 
     # ------------------------------------------------------------------
-    # Frame-level target construction
+    # Frame-level target construction (unchanged)
     # ------------------------------------------------------------------
 
     def build_frame_targets(self, batch, hidden, wav_lens):
@@ -226,7 +270,7 @@ class ASR_Brain(sb.Brain):
         return p1
 
     # ------------------------------------------------------------------
-    # Monitoring helpers
+    # Monitoring helpers (unchanged)
     # ------------------------------------------------------------------
 
     def _init_monitor_sums(self):
@@ -290,19 +334,24 @@ class ASR_Brain(sb.Brain):
         max_prob_mean = probs.max(dim=-1).values.mean()
 
         vt_mean_abs = vt.abs().mean()
-        vt_l2 = torch.sqrt((vt ** 2).sum(dim=-1)).mean()
-        vt_sum_mean = vt.sum(dim=-1).mean()
+        vt_l2 = vt.norm(dim=-1).mean()
+        vt_sum_mean = vt.sum(dim=-1).abs().mean()
 
         vpred_mean_abs = vpred.abs().mean()
-        vpred_l2 = torch.sqrt((vpred ** 2).sum(dim=-1)).mean()
-        vpred_sum_mean = vpred.sum(dim=-1).mean()
+        vpred_l2 = vpred.norm(dim=-1).mean()
+        vpred_sum_mean = vpred.sum(dim=-1).abs().mean()
 
         velocity_mse_monitor = ((vpred - vt) ** 2).mean()
-        cos = F.cosine_similarity(vpred, vt, dim=-1).mean()
+        cos = F.cosine_similarity(
+            vpred.reshape(-1, vpred.size(-1)),
+            vt.reshape(-1, vt.size(-1)),
+            dim=-1,
+        ).mean()
 
         self.monitor_sums["loss"] += float(total_loss.detach().cpu())
         self.monitor_sums["ctc_loss"] += float(ctc_loss.detach().cpu())
         self.monitor_sums["fm_loss"] += float(fm_loss.detach().cpu())
+
         self.monitor_sums["logits_mean"] += float(
             logits.mean().detach().cpu()
         )
@@ -312,25 +361,39 @@ class ASR_Brain(sb.Brain):
         self.monitor_sums["alpha_mean"] += float(
             alpha.mean().detach().cpu()
         )
-        self.monitor_sums["alpha_std"] += float(alpha.std().detach().cpu())
+        self.monitor_sums["alpha_std"] += float(
+            alpha.std().detach().cpu()
+        )
 
-        self.monitor_sums["p0_entropy"] += float(p0_entropy.detach().cpu())
+        self.monitor_sums["p0_entropy"] += float(
+            p0_entropy.detach().cpu()
+        )
         self.monitor_sums["p0_row_sum_mean"] += float(
             p0.sum(dim=-1).mean().detach().cpu()
         )
-        self.monitor_sums["p0_min"] += float(p0.min().detach().cpu())
+        self.monitor_sums["p0_min"] += float(
+            p0.min().detach().cpu()
+        )
 
-        self.monitor_sums["p1_entropy"] += float(p1_entropy.detach().cpu())
+        self.monitor_sums["p1_entropy"] += float(
+            p1_entropy.detach().cpu()
+        )
         self.monitor_sums["p1_row_sum_mean"] += float(
             p1.sum(dim=-1).mean().detach().cpu()
         )
-        self.monitor_sums["p1_min"] += float(p1.min().detach().cpu())
+        self.monitor_sums["p1_min"] += float(
+            p1.min().detach().cpu()
+        )
 
-        self.monitor_sums["pt_entropy"] += float(pt_entropy.detach().cpu())
+        self.monitor_sums["pt_entropy"] += float(
+            pt_entropy.detach().cpu()
+        )
         self.monitor_sums["pt_row_sum_mean"] += float(
             pt.sum(dim=-1).mean().detach().cpu()
         )
-        self.monitor_sums["pt_min"] += float(pt.min().detach().cpu())
+        self.monitor_sums["pt_min"] += float(
+            pt.min().detach().cpu()
+        )
 
         self.monitor_sums["vt_mean_abs"] += float(
             vt_mean_abs.detach().cpu()
@@ -399,7 +462,7 @@ class ASR_Brain(sb.Brain):
         return total ** 0.5
 
     # ------------------------------------------------------------------
-    # Forward pass
+    # Forward pass (CHANGED: uses uniform instead of p0 for flow)
     # ------------------------------------------------------------------
 
     def compute_forward(self, batch, stage):
@@ -413,6 +476,7 @@ class ASR_Brain(sb.Brain):
         feats = self.modules.normalize(feats, wav_lens)
 
         # Encoder: lines 5-8 of Algorithm 2
+        # p0 is STILL computed for the CTC loss path (unchanged)
         hidden = self.modules.model(feats)
         logits = self.modules.output(hidden)
         alpha = self.logits_to_dirichlet(logits)
@@ -424,19 +488,27 @@ class ASR_Brain(sb.Brain):
         )
         p1 = self.make_target_simplex(frame_ids)
 
+        # ============================================================
+        # CHANGED: Create uniform distribution as the flow start point
+        # Instead of using p0, the flow now starts from 1/K everywhere
+        # ============================================================
+        p_uniform = self.make_uniform(p0)
+
         # Sample t, bridge, velocity: lines 10-13
+        # CHANGED: bridge and velocity use p_uniform instead of p0
         t = torch.rand(1, device=hidden.device).item()
-        pt = self.bridge_state(p0, p1, t)
-        vt = self.target_velocity(p0, p1)
+        pt = self.bridge_state(p_uniform, p1, t)       # was: (p0, p1, t)
+        vt = self.target_velocity(p_uniform, p1)        # was: (p0, p1)
         vpred = self.modules.velocity_net(pt, t, hidden)
 
-        # p0 log-probs for CTC loss and p0 PER metric
+        # p0 log-probs for CTC loss and p0 PER metric (UNCHANGED)
         log_probs = torch.log(p0.clamp_min(1e-8))
 
         # Flow integration only at eval time
+        # CHANGED: starts from p_uniform instead of p0
         if stage != sb.Stage.TRAIN:
             p_flow = self.integrate_flow(
-                p0, hidden, self.hparams.num_flow_steps
+                p_uniform, hidden, self.hparams.num_flow_steps  # was: p0
             )
         else:
             p_flow = None
@@ -459,7 +531,7 @@ class ASR_Brain(sb.Brain):
         }
 
     # ------------------------------------------------------------------
-    # Objectives
+    # Objectives (unchanged)
     # ------------------------------------------------------------------
 
     def compute_objectives(self, predictions, batch, stage):
@@ -482,7 +554,7 @@ class ASR_Brain(sb.Brain):
             phns = self.hparams.wav_augment.replicate_labels(phns)
             phn_lens = self.hparams.wav_augment.replicate_labels(phn_lens)
 
-        # CTC loss on p0 log-probs (always)
+        # CTC loss on p0 log-probs (always, unchanged)
         ctc_loss = self.hparams.compute_cost(
             log_probs, phns, pout_lens, phn_lens
         )
@@ -529,10 +601,7 @@ class ASR_Brain(sb.Brain):
                 ind2lab=self.label_encoder.decode_ndim,
             )
 
-            # ----- Flow PER: frame-aligned argmax+collapse (KEY FIX) -----
-            # Uses decode_flow_output instead of ctc_greedy_decode because
-            # the flow produces frame-level phoneme predictions with explicit
-            # alignment, not CTC-style blank-heavy implicit alignment.
+            # ----- Flow PER: frame-aligned argmax+collapse -----
             sequence_flow = self.decode_flow_output(p_flow, pout_lens)
             self.per_metrics_flow.append(
                 ids=batch.id,
@@ -542,28 +611,7 @@ class ASR_Brain(sb.Brain):
                 ind2lab=self.label_encoder.decode_ndim,
             )
 
-            self._update_monitor_sums(
-                total_loss=total_loss,
-                ctc_loss=ctc_loss,
-                fm_loss=fm_loss,
-                logits=logits,
-                alpha=alpha,
-                p0=p0,
-                p1=p1,
-                pt=pt,
-                vt=vt,
-                vpred=vpred,
-                t_value=t,
-                log_probs=log_probs,
-                grad_norm=None,
-                p_flow=p_flow,
-            )
-
         return total_loss
-
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
 
     def fit_batch(self, batch):
         predictions = self.compute_forward(batch, sb.Stage.TRAIN)
@@ -571,8 +619,10 @@ class ASR_Brain(sb.Brain):
 
         self.optimizer.zero_grad()
         loss.backward()
-
         grad_norm = self._get_grad_norm()
+
+        if self.check_gradients(loss):
+            self.optimizer.step()
 
         self._update_monitor_sums(
             total_loss=self.current_batch_stats["loss"],
@@ -591,7 +641,6 @@ class ASR_Brain(sb.Brain):
             p_flow=self.current_batch_stats["p_flow"],
         )
 
-        self.optimizer.step()
         return loss.detach()
 
     def evaluate_batch(self, batch, stage):
@@ -669,13 +718,12 @@ class ASR_Brain(sb.Brain):
 
 
 # ======================================================================
-# Data pipeline
+# Data pipeline (unchanged)
 # ======================================================================
 
 
 def dataio_prep(hparams):
     """Creates the datasets and their data processing pipelines."""
-
     data_folder = hparams["data_folder"]
 
     train_data = sb.dataio.dataset.DynamicItemDataset.from_json(
