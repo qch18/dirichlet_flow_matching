@@ -1,15 +1,8 @@
 # ################################
 # Stage 9: CTC + DFM with UNIFORM-START flow
 #
-# Changes from Stage 8b (p0-start):
-# 1. run_name: dfm_stage9_uniform_start
-# 2. Output folder updated to separate results from p0 version
-# 3. All other hyperparameters IDENTICAL to Stage 8b for fair comparison
-#
-# The flow now starts from a uniform distribution (1/K) instead of the
-# encoder's p0 output. The CTC path is unchanged. This provides a second
-# comparison point: how well can the flow reconstruct the target when it
-# starts with zero information (only encoder hidden states as conditioning)?
+# Identical to Stage 8b except the flow starts from uniform (1/K)
+# instead of p0. Only train.py compute_forward changed.
 # ################################
 
 seed: 1986
@@ -131,29 +124,47 @@ add_noise: !new:speechbrain.augment.time_domain.AddNoise
 
 speed_perturb: !new:speechbrain.augment.time_domain.SpeedPerturb
     orig_freq: !ref <sample_rate>
-    speeds: [95, 100, 105]
+    speeds: [98, 100, 102]
+
+drop_freq: !new:speechbrain.augment.time_domain.DropFreq
+    drop_freq_low: 0
+    drop_freq_high: 1
+    drop_freq_count_low: 1
+    drop_freq_count_high: 2
+    drop_freq_width: 0.03
+
+drop_chunk: !new:speechbrain.augment.time_domain.DropChunk
+    drop_length_low: 400
+    drop_length_high: 1000
+    drop_count_low: 1
+    drop_count_high: 2
 
 wav_augment: !new:speechbrain.augment.augmenter.Augmenter
-    parallel_augment: False
     concat_original: False
-    repeat_augment: 1
-    shuffle_augmentations: False
-    min_augmentations: 2
+    min_augmentations: 1
     max_augmentations: 2
-    augment_prob: 1.0
+    augment_prob: 0.5
     augmentations: [
-        !ref <speed_perturb>,
         !ref <add_noise>,
+        !ref <speed_perturb>,
+        !ref <drop_freq>,
+        !ref <drop_chunk>
     ]
 
 # ----------------------------------------------------------------------
-# Model
+# Training helpers
 # ----------------------------------------------------------------------
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
 compute_features: !new:speechbrain.lobes.features.Fbank
+    sample_rate: !ref <sample_rate>
     n_fft: !ref <n_fft>
     n_mels: !ref <n_mels>
-    sample_rate: !ref <sample_rate>
 
+# ----------------------------------------------------------------------
+# Encoder (CRDNN acoustic model)
+# ----------------------------------------------------------------------
 model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     input_size: !ref <n_mels>
     activation: !ref <activation>
@@ -162,35 +173,34 @@ model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     cnn_channels: !ref <cnn_channels>
     cnn_kernelsize: !ref <cnn_kernelsize>
     time_pooling: True
-    rnn_class: !name:speechbrain.nnet.RNN.LSTM
     rnn_layers: !ref <rnn_layers>
     rnn_neurons: !ref <rnn_neurons>
     rnn_bidirectional: !ref <rnn_bidirectional>
     dnn_blocks: !ref <dnn_blocks>
     dnn_neurons: !ref <dnn_neurons>
 
+# Linear projection head: H -> Z (logits)
 output: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <dnn_neurons>
     n_neurons: !ref <output_neurons>
+    bias: True
 
-velocity_net: !new:train.VelocityNet
+# Velocity network: v_theta(p_t, t, H)
+velocity_net: !new:__main__.VelocityNet
     vocab_size: !ref <output_neurons>
     hidden_size: !ref <dnn_neurons>
     velocity_hidden: !ref <velocity_hidden>
 
-modules:
-    normalize: !ref <normalize>
-    model: !ref <model>
-    output: !ref <output>
-    velocity_net: !ref <velocity_net>
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+    apply_log: True
 
 # ----------------------------------------------------------------------
-# Optimizer and scheduler
+# Optimizer / scheduler
 # ----------------------------------------------------------------------
 opt_class: !name:torch.optim.Adadelta
-    lr: !ref <lr>
     rho: 0.95
-    eps: 1.0e-8
+    lr: !ref <lr>
+    eps: 1.e-8
 
 lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
     initial_value: !ref <lr>
@@ -199,29 +209,37 @@ lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
     patient: 0
 
 # ----------------------------------------------------------------------
-# Logging and checkpointing
+# Registered trainable modules
 # ----------------------------------------------------------------------
-epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
-    limit: !ref <number_of_epochs>
+modules:
+    model: !ref <model>
+    output: !ref <output>
+    velocity_net: !ref <velocity_net>
+    normalize: !ref <normalize>
 
-train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
-    save_file: !ref <train_log>
+jit_module_keys: [model]
 
+# ----------------------------------------------------------------------
+# Checkpointing
+# ----------------------------------------------------------------------
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
         output: !ref <output>
         velocity_net: !ref <velocity_net>
-        normalize: !ref <normalize>
         scheduler: !ref <lr_annealing>
+        normalizer: !ref <normalize>
         counter: !ref <epoch_counter>
 
 # ----------------------------------------------------------------------
-# Loss and metrics
+# Loss / logging / metrics
 # ----------------------------------------------------------------------
 compute_cost: !name:speechbrain.nnet.losses.ctc_loss
     blank_index: !ref <blank_index>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
 
 ctc_stats: !name:speechbrain.utils.metric_stats.MetricStats
     metric: !name:speechbrain.nnet.losses.ctc_loss
