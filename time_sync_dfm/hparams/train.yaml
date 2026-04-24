@@ -1,15 +1,14 @@
 # ################################
-# Stage 8b: CTC + DFM with frame-aligned flow decoding
+# Stage 11: Time-Synchronous DFM (Algorithms 3 & 4)
 #
-# Changes from Stage 8:
-# 1. run_name: dfm_stage8b_frame_decode
-# 2. lambda_fm raised to 0.5 (stronger FM supervision for better velocity)
-# 3. num_flow_steps: 10 (Euler integration steps at inference)
-# 4. LR scheduling uses p0 PER for stability
+# Changes from Stage 8c:
+# 1. Piecewise linear bridge through phone boundary waypoints
+# 2. Per-segment t sampling (each phone gets its own t)
+# 3. Time-sync inference (flow time maps to frame position)
 # ################################
 
 seed: 1986
-run_name: dfm_stage8b_frame_decode
+run_name: dfm_stage11_time_sync
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -73,10 +72,10 @@ blank_index: 0
 # ----------------------------------------------------------------------
 dfm_epsilon: 1.0e-6
 target_smoothing: 0.02
-velocity_hidden: 256
+velocity_hidden: 512
 
-# Euler integration steps at inference (10 is a good balance)
-num_flow_steps: 10
+# Euler integration steps at inference (20 halves the step size vs 10)
+num_flow_steps: 20
 
 # ----------------------------------------------------------------------
 # Hybrid loss weights

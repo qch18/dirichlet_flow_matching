@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
-"""Stage 8b: CTC ASR on TIMIT with proper Dirichlet Flow Matching.
+"""Stage 8c: Improved flow for CTC ASR on TIMIT with Dirichlet Flow Matching.
 
-Changes from Stage 8:
----------------------
-KEY FIX: Flow decoding now uses frame-aligned argmax + collapse, NOT CTC
-greedy decode. The flow is trained to match frame-level phoneme targets from
-AlignToFrames, so its output already has explicit time alignment. CTC greedy
-decode fails because it expects blank-heavy output for implicit alignment.
+Based on Stage 8b with targeted fixes to close the gap between flow PER
+and p0 PER. The core architecture (encoder, CTC, bridge, decoding) is
+identical to Stage 8b.
 
-The two decoding strategies compared:
-  - p0 path:   CTC greedy decode (implicit alignment via blanks)
-  - flow path: argmax per frame -> collapse consecutive duplicates -> remove
-               blanks (explicit alignment from AlignToFrames + learned flow)
-
-Also changed: LR scheduling and checkpointing use p0 PER (stable CTC metric)
-so that the learning rate is not destabilised by early-epoch flow noise.
-
-Algorithm reference (Algorithm 2 from dissertation):
-  Training: sample t, build bridge pt* = (1-t)p0 + tp1, compute target velocity
-            vt* = p1-p0, predict v_hat = v_theta(pt*, t, H), loss = ||v_hat - vt*||^2
-  Inference: start from p0, integrate dp/dt = v_theta(p, t, H) from t=0 to t=1
-             using Euler steps, decode from the resulting p_final using argmax+collapse
+What changed vs Stage 8b:
+  1. VelocityNet: frame-wise MLP replaced with temporal conv net.
+     Two 1D conv layers (kernel_size=5) give each frame access to 9
+     neighboring frames, so the velocity prediction can use context
+     instead of processing each frame in isolation.
+  2. Per-sample t: each sample in the batch gets a different random t
+     instead of sharing one t across the whole batch. This gives 16x
+     more diverse training signal per batch.
+  3. More Euler steps at inference (20 vs 10) to reduce integration error.
+  4. Wider velocity hidden (512 vs 256) for more capacity.
 """
 
 import os
@@ -39,34 +33,67 @@ logger = get_logger(__name__)
 
 
 class VelocityNet(nn.Module):
-    """Predicts the velocity field v_theta(p_t, t, H).
+    """Improved velocity field with temporal context.
 
-    Takes the current simplex state p_t, the scalar flow time t, and the
-    encoder hidden states H, and outputs a velocity vector for each frame.
-    The output is zero-mean across the vocab dimension so it preserves the
-    simplex constraint (probabilities sum to 1) during integration.
+    Stage 8b used a frame-wise MLP: each frame was processed independently,
+    so the velocity prediction at frame t had no information about what was
+    happening at frames t-1 or t+1. This is a major limitation because
+    phoneme identity often depends on surrounding context (e.g. distinguishing
+    "b" from "p" requires hearing what comes after).
+
+    This version uses two 1D convolutional layers (kernel_size=5, padding=2)
+    before the per-frame MLP head. Each conv layer lets a frame see 2
+    neighbors on each side. After two layers, the effective receptive field
+    is 9 frames, giving each velocity prediction access to local temporal
+    context.
+
+    The output is still zero-mean across the vocab dimension to preserve
+    the simplex constraint during integration.
     """
 
-    def __init__(self, vocab_size, hidden_size, velocity_hidden=256):
+    def __init__(self, vocab_size, hidden_size, velocity_hidden=512):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(vocab_size + hidden_size + 1, velocity_hidden),
+        input_size = vocab_size + hidden_size + 1
+
+        # Temporal context: 1D convolutions see neighboring frames
+        # After 2 layers with kernel_size=5, receptive field = 9 frames
+        self.temporal = nn.Sequential(
+            nn.Conv1d(input_size, velocity_hidden, kernel_size=5, padding=2),
             nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Conv1d(velocity_hidden, velocity_hidden, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+
+        # Per-frame refinement head
+        self.head = nn.Sequential(
             nn.Linear(velocity_hidden, velocity_hidden),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(velocity_hidden, vocab_size),
         )
 
     def forward(self, pt, t, hidden):
-        t_tensor = torch.full(
-            (pt.size(0), pt.size(1), 1),
-            float(t),
-            device=pt.device,
-            dtype=pt.dtype,
-        )
-        inp = torch.cat([pt, hidden, t_tensor], dim=-1)
-        v = self.net(inp)
-        v = v - v.mean(dim=-1, keepdim=True)
+        B, T, _ = pt.size()
+
+        # Handle both scalar t (inference) and per-sample t (training)
+        if isinstance(t, (int, float)):
+            t_tensor = torch.full(
+                (B, T, 1), float(t), device=pt.device, dtype=pt.dtype
+            )
+        else:
+            # t is [B, 1, 1] from per-sample sampling, expand to [B, T, 1]
+            t_tensor = t.expand(B, T, 1)
+
+        inp = torch.cat([pt, hidden, t_tensor], dim=-1)  # [B, T, input_size]
+
+        # Temporal processing: Conv1d expects [B, Channels, Time]
+        x = self.temporal(inp.transpose(1, 2)).transpose(1, 2)  # [B, T, velocity_hidden]
+
+        # Per-frame velocity prediction
+        v = self.head(x)
+        v = v - v.mean(dim=-1, keepdim=True)  # zero-mean preserves simplex
         return v
 
 
@@ -424,8 +451,10 @@ class ASR_Brain(sb.Brain):
         )
         p1 = self.make_target_simplex(frame_ids)
 
-        # Sample t, bridge, velocity: lines 10-13
-        t = torch.rand(1, device=hidden.device).item()
+        # Sample t: per-sample instead of per-batch (Stage 8b used one t for
+        # the whole batch). Each sample gets its own random t, giving 16x more
+        # diverse training signal. Shape [B, 1, 1] broadcasts with [B, T, K].
+        t = torch.rand(hidden.size(0), 1, 1, device=hidden.device)
         pt = self.bridge_state(p0, p1, t)
         vt = self.target_velocity(p0, p1)
         vpred = self.modules.velocity_net(pt, t, hidden)
@@ -450,7 +479,7 @@ class ASR_Brain(sb.Brain):
             "pt": pt,
             "vt": vt,
             "vpred": vpred,
-            "t": t,
+            "t": t.mean().item(),
             "frame_ids": frame_ids,
             "frame_mask": frame_mask,
             "log_probs": log_probs,
