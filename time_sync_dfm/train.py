@@ -1,20 +1,40 @@
 #!/usr/bin/env python3
-"""Stage 8c: Improved flow for CTC ASR on TIMIT with Dirichlet Flow Matching.
+"""Stage 13: Time-Synchronous DFM with Direction-Magnitude Decoupling.
 
-Based on Stage 8b with targeted fixes to close the gap between flow PER
-and p0 PER. The core architecture (encoder, CTC, bridge, decoding) is
-identical to Stage 8b.
+Stage 12 revealed that the velocity net's direction predictions generalise
+well (cosine ~0.75+ on validation) but the magnitude overfits badly
+(train vpred_l2 stable at ~46, valid vpred_l2 swings 50-79). This caused
+flow PER to oscillate between 17 and 44 depending on the epoch.
 
-What changed vs Stage 8b:
-  1. VelocityNet: frame-wise MLP replaced with temporal conv net.
-     Two 1D conv layers (kernel_size=5) give each frame access to 9
-     neighboring frames, so the velocity prediction can use context
-     instead of processing each frame in isolation.
-  2. Per-sample t: each sample in the batch gets a different random t
-     instead of sharing one t across the whole batch. This gives 16x
-     more diverse training signal per batch.
-  3. More Euler steps at inference (20 vs 10) to reduce integration error.
-  4. Wider velocity hidden (512 vs 256) for more capacity.
+The root cause: piecewise target velocities have large, utterance-specific
+magnitudes (~51 L2) because they divide by segment duration. Short phones
+produce very large velocities, long phones produce small ones. The velocity
+net memorises these patterns on training data but produces erratic magnitudes
+on unseen utterances.
+
+This version applies three complementary fixes:
+
+Fix 1 - Normalised training targets (removes magnitude from the learning
+problem entirely):
+  Target velocities are normalised to unit length during training. The
+  velocity net only needs to learn WHICH DIRECTION to push each frame's
+  distribution, not how far. This makes the targets consistent across
+  segments regardless of phone duration, eliminating the main source of
+  overfitting.
+
+Fix 2 - Regularised velocity net (reduces capacity to prevent memorisation):
+  Back to 512 hidden (from 768), 0.1 dropout (from 0.05), but keeps the
+  three conv layers and GroupNorm from Stage 12. Also adds explicit L2
+  weight decay on velocity net parameters.
+
+Fix 3 - Fixed magnitude at inference (ensures stable corrections):
+  During inference, predicted velocities are normalised to unit length
+  and then scaled by a fixed velocity_inference_scale parameter. This
+  guarantees consistent correction magnitudes across all utterances.
+
+The result: the velocity net focuses purely on direction prediction
+(which it already does well), and the correction magnitude is controlled
+by a single tunable hyperparameter instead of learned per-utterance.
 """
 
 import os
@@ -33,19 +53,21 @@ logger = get_logger(__name__)
 
 
 class VelocityNet(nn.Module):
-    """Improved velocity field with temporal context.
+    """Direction-focused velocity field with regularised temporal context.
 
-    Stage 8b used a frame-wise MLP: each frame was processed independently,
-    so the velocity prediction at frame t had no information about what was
-    happening at frames t-1 or t+1. This is a major limitation because
-    phoneme identity often depends on surrounding context (e.g. distinguishing
-    "b" from "p" requires hearing what comes after).
+    This version is designed to predict velocity DIRECTIONS only, not
+    magnitudes. The training targets are unit-normalised, so the net
+    learns which direction to push each frame's distribution without
+    needing to predict how far.
 
-    This version uses two 1D convolutional layers (kernel_size=5, padding=2)
-    before the per-frame MLP head. Each conv layer lets a frame see 2
-    neighbors on each side. After two layers, the effective receptive field
-    is 9 frames, giving each velocity prediction access to local temporal
-    context.
+    Architecture choices for generalisation:
+      - Three conv layers (receptive field 13 frames / ~130ms) give
+        broad context for each single-update prediction
+      - GroupNorm after each conv stabilises training
+      - 512 hidden (down from Stage 12's 768) reduces capacity to
+        prevent memorisation of training-specific patterns
+      - 0.1 dropout (up from Stage 12's 0.05) provides stronger
+        regularisation against overfitting
 
     The output is still zero-mean across the vocab dimension to preserve
     the simplex constraint during integration.
@@ -55,13 +77,18 @@ class VelocityNet(nn.Module):
         super().__init__()
         input_size = vocab_size + hidden_size + 1
 
-        # Temporal context: 1D convolutions see neighboring frames
-        # After 2 layers with kernel_size=5, receptive field = 9 frames
+        # Temporal context: 3 conv layers, receptive field = 13 frames
         self.temporal = nn.Sequential(
             nn.Conv1d(input_size, velocity_hidden, kernel_size=5, padding=2),
+            nn.GroupNorm(1, velocity_hidden),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Conv1d(velocity_hidden, velocity_hidden, kernel_size=5, padding=2),
+            nn.GroupNorm(1, velocity_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Conv1d(velocity_hidden, velocity_hidden, kernel_size=5, padding=2),
+            nn.GroupNorm(1, velocity_hidden),
             nn.ReLU(),
             nn.Dropout(0.1),
         )
@@ -130,22 +157,73 @@ class ASR_Brain(sb.Brain):
     # ------------------------------------------------------------------
 
     def integrate_flow(self, p0, hidden, num_steps):
-        """Euler integration of the learned velocity field from t=0 to t=1.
+        """Local-window Euler integration with magnitude-controlled velocities.
 
-        At each step: p(t + dt) = p(t) + dt * v_theta(p(t), t, H)
-        then project back onto the simplex (clamp + renormalise).
+        Same local-window sweep as Stage 11b/12 (each frame gets one update),
+        but with two critical additions for stable flow PER:
+
+        1. Predicted velocities are normalised to unit length per frame
+        2. Then scaled by a fixed velocity_inference_scale parameter
+
+        This decouples direction (learned, generalises well) from magnitude
+        (fixed, no overfitting). The velocity net was trained on unit-length
+        targets, so its predictions are already near unit length, but
+        normalising at inference eliminates any residual magnitude variance.
+
+        The velocity_inference_scale parameter controls how much each
+        frame's distribution changes in a single update. Too small and
+        the flow barely modifies p0. Too large and it overshoots past
+        the correct phoneme. The optimal value can be found by sweeping
+        at test time without retraining.
         """
         dt = 1.0 / num_steps
         p = p0.clone()
-        t = 0.0
+        B, T_enc = hidden.size(0), hidden.size(1)
+        scale = self.hparams.velocity_inference_scale
+
         for step in range(num_steps):
-            v = self.modules.velocity_net(p, t, hidden)
-            p = p + dt * v
-            p = p.clamp_min(self.hparams.dfm_epsilon)
-            p = p / p.sum(dim=-1, keepdim=True).clamp_min(
+            t = step * dt
+
+            # Frame window for this step
+            frame_start = int(t * T_enc)
+            frame_end = min(int((t + dt) * T_enc), T_enc)
+            frame_start = min(frame_start, T_enc - 1)
+            frame_end = max(frame_end, frame_start + 1)
+
+            # H_τ: acoustic conditioning at the center of the window
+            tau = min(int((frame_start + frame_end) / 2), T_enc - 1)
+            h_tau = hidden[:, tau:tau+1, :].expand_as(hidden)
+
+            # Run velocity net on ALL frames (temporal convs need context)
+            v = self.modules.velocity_net(p, t, h_tau)
+
+            # ============================================================
+            # Fix 1+3: Normalise to unit length, then scale by fixed factor
+            # Direction from the learned net, magnitude from the parameter.
+            # This eliminates magnitude overfitting entirely.
+            # ============================================================
+            v_local = v[:, frame_start:frame_end, :]
+            v_norm = torch.sqrt(
+                (v_local ** 2).sum(dim=-1, keepdim=True)
+            ).clamp_min(1e-8)
+            v_local = v_local / v_norm * scale
+
+            # Apply the scaled update to the local window
+            p[:, frame_start:frame_end, :] = (
+                p[:, frame_start:frame_end, :] + dt * v_local
+            )
+
+            # Project updated frames back onto simplex
+            p[:, frame_start:frame_end, :] = p[:, frame_start:frame_end, :].clamp_min(
                 self.hparams.dfm_epsilon
             )
-            t += dt
+            window_sum = p[:, frame_start:frame_end, :].sum(
+                dim=-1, keepdim=True
+            ).clamp_min(self.hparams.dfm_epsilon)
+            p[:, frame_start:frame_end, :] = (
+                p[:, frame_start:frame_end, :] / window_sum
+            )
+
         return p
 
     # ------------------------------------------------------------------
@@ -251,6 +329,157 @@ class ASR_Brain(sb.Brain):
         smooth = self.hparams.target_smoothing
         p1 = (1.0 - smooth) * p1 + smooth / self.hparams.output_neurons
         return p1
+
+    # ------------------------------------------------------------------
+    # Time-synchronous bridge (Algorithm 3, lines 8-16)
+    # ------------------------------------------------------------------
+
+    def _make_smoothed_onehot(self, phon_id, device):
+        """Create a smoothed one-hot distribution for a single phone."""
+        V = self.hparams.output_neurons
+        smooth = self.hparams.target_smoothing
+        w = torch.zeros(V, device=device)
+        w[phon_id] = 1.0
+        w = (1.0 - smooth) * w + smooth / V
+        return w
+
+    def build_time_sync_bridge(self, batch, hidden, wav_lens, p0):
+        """Algorithm 3, lines 8-18: Piecewise linear bridge with time-indexed H.
+
+        The KEY time-synchronous feature: each segment's flow time t*
+        maps to a frame position τ = floor(t* × T'), and the velocity
+        net is conditioned on H_τ (the hidden state at that position)
+        instead of each frame's own hidden state.
+
+        This means the velocity net learns:
+          "given that I'm at flow time t* (= position τ in the utterance),
+           and the acoustic features at position τ are H_τ,
+           how should I update the distribution?"
+
+        This is what makes flow time = utterance time.
+
+        Returns:
+            pt:             [B, T, V]  bridge states (per-frame)
+            vt:             [B, T, V]  target velocities (per-frame)
+            t_per_frame:    [B, T, 1]  flow time at each frame
+            mask:           [B, T]     valid frame mask
+            hidden_indexed: [B, T, d]  time-indexed hidden states (H_τ per frame)
+        """
+        device = hidden.device
+        B, T_enc, V = p0.size()
+
+        pt = torch.zeros_like(p0)
+        vt = torch.zeros_like(p0)
+        t_per_frame = torch.zeros(B, T_enc, 1, device=device)
+        hidden_indexed = torch.zeros_like(hidden)
+        mask = torch.zeros(B, T_enc, device=device)
+
+        max_wav_len = batch.sig[0].size(1)
+
+        for b in range(B):
+            valid_samples = int(
+                round(float(wav_lens[b].detach().cpu()) * max_wav_len)
+            )
+            valid_samples = max(valid_samples, 1)
+
+            phns = batch.phn_list[b]
+            ends = batch.phn_end_list[b]
+
+            # ---- Algorithm 3, line 9: waypoint times ----
+            waypoint_times = [0.0]
+            for end_sample in ends:
+                waypoint_times.append(
+                    min(float(end_sample) / valid_samples, 1.0)
+                )
+
+            # ---- Algorithm 3, line 10: waypoint states ----
+            waypoint_ids = []
+            for phon in phns:
+                phon_id = int(
+                    self.label_encoder.encode_sequence_torch([phon])[0].item()
+                )
+                waypoint_ids.append(phon_id)
+
+            # ---- Process each segment k ----
+            prev_end_sample = 0
+            for k in range(len(phns)):
+                end_sample = ends[k]
+
+                start_frame = int(
+                    round((prev_end_sample / valid_samples) * T_enc)
+                )
+                end_frame = int(
+                    round((end_sample / valid_samples) * T_enc)
+                )
+                start_frame = max(0, min(T_enc - 1, start_frame))
+                end_frame = max(start_frame + 1, min(T_enc, end_frame))
+                seg_len = end_frame - start_frame
+
+                t_start = waypoint_times[k]
+                t_end = waypoint_times[k + 1]
+                dt_seg = max(t_end - t_start, 1e-6)
+
+                # Algorithm 3, line 14: sample t* for this segment
+                t_star = t_start + torch.rand(1, device=device).item() * dt_seg
+
+                # ============================================================
+                # Algorithm 3, line 17: τ ← floor(t* × T')
+                # Map flow time to encoder frame index. This connects
+                # flow time to utterance position.
+                # ============================================================
+                tau = min(int(t_star * T_enc), T_enc - 1)
+
+                # ============================================================
+                # Algorithm 3, line 18: v_θ(p, t*, H_τ)
+                # All frames in this segment are conditioned on H_τ,
+                # NOT on their own per-frame hidden state. This is the
+                # key difference from Stage 8c.
+                # ============================================================
+                hidden_indexed[b, start_frame:end_frame] = (
+                    hidden[b, tau].detach().unsqueeze(0).expand(seg_len, -1)
+                )
+
+                # Waypoint states
+                w_k = self._make_smoothed_onehot(waypoint_ids[k], device)
+
+                if k == 0:
+                    w_prev = p0[b, start_frame:end_frame].detach()
+                else:
+                    w_prev = self._make_smoothed_onehot(
+                        waypoint_ids[k - 1], device
+                    ).unsqueeze(0).expand(seg_len, -1)
+
+                w_k_expanded = w_k.unsqueeze(0).expand(seg_len, -1)
+
+                # Algorithm 3, line 11: bridge state
+                frac = (t_star - t_start) / dt_seg
+                pt[b, start_frame:end_frame] = (
+                    w_prev + frac * (w_k_expanded - w_prev)
+                )
+
+                # Algorithm 3, line 12: target velocity
+                # Raw velocity: (w_k - w_prev) / dt_seg
+                raw_vt = (w_k_expanded - w_prev) / dt_seg
+
+                # ============================================================
+                # Fix 3: Normalise target velocity to unit length.
+                # The velocity net only needs to learn DIRECTION, not
+                # magnitude. This eliminates the main source of overfitting:
+                # short phones had huge velocities (~100+ L2) while long
+                # phones had small ones (~20 L2). After normalisation,
+                # all segments have L2 = 1.0 regardless of duration.
+                # ============================================================
+                raw_vt_norm = torch.sqrt(
+                    (raw_vt ** 2).sum(dim=-1, keepdim=True)
+                ).clamp_min(1e-8)
+                vt[b, start_frame:end_frame] = raw_vt / raw_vt_norm
+
+                t_per_frame[b, start_frame:end_frame, 0] = t_star
+                mask[b, start_frame:end_frame] = 1.0
+
+                prev_end_sample = end_sample
+
+        return pt, vt, t_per_frame, mask, hidden_indexed
 
     # ------------------------------------------------------------------
     # Monitoring helpers
@@ -439,25 +668,37 @@ class ASR_Brain(sb.Brain):
         feats = self.hparams.compute_features(wavs)
         feats = self.modules.normalize(feats, wav_lens)
 
-        # Encoder: lines 5-8 of Algorithm 2
+        # Encoder: Algorithm 3, lines 4-7
         hidden = self.modules.model(feats)
         logits = self.modules.output(hidden)
         alpha = self.logits_to_dirichlet(logits)
         p0 = self.dirichlet_mean(alpha)
 
-        # Frame targets: line 9
+        # Frame targets (still needed for p1 in monitoring and CTC)
         frame_ids, frame_mask = self.build_frame_targets(
             batch, hidden, wav_lens
         )
         p1 = self.make_target_simplex(frame_ids)
 
-        # Sample t: per-sample instead of per-batch (Stage 8b used one t for
-        # the whole batch). Each sample gets its own random t, giving 16x more
-        # diverse training signal. Shape [B, 1, 1] broadcasts with [B, T, K].
-        t = torch.rand(hidden.size(0), 1, 1, device=hidden.device)
-        pt = self.bridge_state(p0, p1, t)
-        vt = self.target_velocity(p0, p1)
-        vpred = self.modules.velocity_net(pt, t, hidden)
+        # ============================================================
+        # TIME-SYNC: Piecewise bridge + time-indexed hidden (Algorithm 3)
+        #
+        # Two key differences from Stage 8c:
+        # 1. Piecewise bridge through phone boundary waypoints
+        # 2. Velocity net conditioned on H_τ (time-indexed hidden)
+        #    instead of per-frame hidden states
+        #
+        # hidden_indexed[b, f, :] = hidden[b, τ_k, :] where τ_k is the
+        # encoder frame corresponding to segment k's flow time t*_k.
+        # This teaches the velocity net: "at flow time t*, the relevant
+        # acoustic information is at frame τ = floor(t* × T')."
+        # ============================================================
+        pt, vt, t_per_frame, ts_mask, hidden_indexed = (
+            self.build_time_sync_bridge(batch, hidden, wav_lens, p0)
+        )
+
+        # Velocity prediction with time-indexed hidden (NOT full hidden)
+        vpred = self.modules.velocity_net(pt, t_per_frame, hidden_indexed)
 
         # p0 log-probs for CTC loss and p0 PER metric
         log_probs = torch.log(p0.clamp_min(1e-8))
@@ -479,9 +720,9 @@ class ASR_Brain(sb.Brain):
             "pt": pt,
             "vt": vt,
             "vpred": vpred,
-            "t": t.mean().item(),
+            "t": t_per_frame.mean().item(),
             "frame_ids": frame_ids,
-            "frame_mask": frame_mask,
+            "frame_mask": ts_mask,  # use time-sync mask
             "log_probs": log_probs,
             "wav_lens": wav_lens,
             "p_flow": p_flow,
@@ -516,9 +757,24 @@ class ASR_Brain(sb.Brain):
             log_probs, phns, pout_lens, phn_lens
         )
 
-        # FM loss: Algorithm 2 line 13
+        # FM loss on unit-normalised targets (Fix 3)
+        # With normalised targets, vpred and vt both have L2 ≈ 1.0,
+        # so the FM loss is on the order of 0.5-2.0 (vs ~80-100 before).
+        # lambda_fm is set higher accordingly (1.0 instead of 0.02).
         fm_sq = ((vpred - vt) ** 2).mean(dim=-1)
         fm_loss = (fm_sq * frame_mask).sum() / frame_mask.sum().clamp_min(1.0)
+
+        # Fix 2: L2 weight decay on velocity net parameters only.
+        # Penalises large weights that enable memorisation of
+        # training-specific magnitude patterns. Does not affect the
+        # encoder because the FM loss is detached from the encoder.
+        velocity_wd = self.hparams.velocity_weight_decay
+        if velocity_wd > 0:
+            l2_reg = sum(
+                p.pow(2).sum()
+                for p in self.modules.velocity_net.parameters()
+            )
+            fm_loss = fm_loss + velocity_wd * l2_reg
 
         total_loss = (
             self.hparams.lambda_ctc * ctc_loss
