@@ -1,40 +1,36 @@
 #!/usr/bin/env python3
-"""Stage 13: Time-Synchronous DFM with Direction-Magnitude Decoupling.
+"""Stage 17: Temperature-Softened Multi-Pass Time-Synchronous DFM.
 
-Stage 12 revealed that the velocity net's direction predictions generalise
-well (cosine ~0.75+ on validation) but the magnitude overfits badly
-(train vpred_l2 stable at ~46, valid vpred_l2 swings 50-79). This caused
-flow PER to oscillate between 17 and 44 depending on the epoch.
+All previous stages shared the same bottleneck: the encoder's p0
+distribution is ~96.5% confident at convergence, leaving almost no
+room for flow corrections. Even with perfect velocity directions,
+the corrections were too small to flip argmax decisions.
 
-The root cause: piecewise target velocities have large, utterance-specific
-magnitudes (~51 L2) because they divide by segment duration. Short phones
-produce very large velocities, long phones produce small ones. The velocity
-net memorises these patterns on training data but produces erratic magnitudes
-on unseen utterances.
+This version addresses the root cause with two inference changes
+(NO retraining needed, uses Stage 13's direction-only velocity net):
 
-This version applies three complementary fixes:
+1. Temperature softening of p0 before flow integration:
+   p_soft = p0^(1/T) / sum(p0^(1/T))
+   With T=3: a [0.95, 0.03, 0.02] distribution becomes [0.72, 0.15, 0.13]
+   Uncertainty goes from 0.05 to 0.28, giving 5.6x more room for corrections.
 
-Fix 1 - Normalised training targets (removes magnitude from the learning
-problem entirely):
-  Target velocities are normalised to unit length during training. The
-  velocity net only needs to learn WHICH DIRECTION to push each frame's
-  distribution, not how far. This makes the targets consistent across
-  segments regardless of phone duration, eliminating the main source of
-  overfitting.
+2. Multi-pass local-window integration:
+   Instead of one sweep from t=0 to t=1, sweep K times.
+   Each pass refines the previous pass's output. The velocity net's
+   temporal convolutions see previously-updated frames, enabling
+   iterative refinement without the train-inference mismatch of
+   global update (Stage 11c).
 
-Fix 2 - Regularised velocity net (reduces capacity to prevent memorisation):
-  Back to 512 hidden (from 768), 0.1 dropout (from 0.05), but keeps the
-  three conv layers and GroupNorm from Stage 12. Also adds explicit L2
-  weight decay on velocity net parameters.
+Why this works without retraining:
+   The velocity net was trained on bridge states p_t that interpolate
+   between p0 and smoothed one-hot targets. A temperature-softened p0
+   is a distribution that falls within this training range (less peaked
+   than p0, more peaked than uniform). The velocity net has seen
+   similar distributions during training and learned appropriate
+   directions for them.
 
-Fix 3 - Fixed magnitude at inference (ensures stable corrections):
-  During inference, predicted velocities are normalised to unit length
-  and then scaled by a fixed velocity_inference_scale parameter. This
-  guarantees consistent correction magnitudes across all utterances.
-
-The result: the velocity net focuses purely on direction prediction
-(which it already does well), and the correction magnitude is controlled
-by a single tunable hyperparameter instead of learned per-utterance.
+Training is identical to Stage 13:
+   Unit-normalised targets, regularised velocity net, L2 weight decay.
 """
 
 import os
@@ -53,24 +49,11 @@ logger = get_logger(__name__)
 
 
 class VelocityNet(nn.Module):
-    """Direction-focused velocity field with regularised temporal context.
+    """Direction-focused velocity field for temperature-softened inference.
 
-    This version is designed to predict velocity DIRECTIONS only, not
-    magnitudes. The training targets are unit-normalised, so the net
-    learns which direction to push each frame's distribution without
-    needing to predict how far.
-
-    Architecture choices for generalisation:
-      - Three conv layers (receptive field 13 frames / ~130ms) give
-        broad context for each single-update prediction
-      - GroupNorm after each conv stabilises training
-      - 512 hidden (down from Stage 12's 768) reduces capacity to
-        prevent memorisation of training-specific patterns
-      - 0.1 dropout (up from Stage 12's 0.05) provides stronger
-        regularisation against overfitting
-
-    The output is still zero-mean across the vocab dimension to preserve
-    the simplex constraint during integration.
+    Trained on unit-normalized target velocities. At inference, receives
+    temperature-softened distributions that are less peaked than p0,
+    falling within the range of bridge states seen during training.
     """
 
     def __init__(self, vocab_size, hidden_size, velocity_hidden=512):
@@ -157,72 +140,94 @@ class ASR_Brain(sb.Brain):
     # ------------------------------------------------------------------
 
     def integrate_flow(self, p0, hidden, num_steps):
-        """Local-window Euler integration with magnitude-controlled velocities.
+        """Temperature-softened multi-pass local-window Euler integration.
 
-        Same local-window sweep as Stage 11b/12 (each frame gets one update),
-        but with two critical additions for stable flow PER:
+        Two key differences from previous stages:
 
-        1. Predicted velocities are normalised to unit length per frame
-        2. Then scaled by a fixed velocity_inference_scale parameter
+        1. Temperature softening: p0 is raised to power 1/T before
+           integration. T>1 flattens the distribution, creating artificial
+           uncertainty. This gives the flow room to make meaningful
+           corrections instead of nudging an already-confident distribution.
 
-        This decouples direction (learned, generalises well) from magnitude
-        (fixed, no overfitting). The velocity net was trained on unit-length
-        targets, so its predictions are already near unit length, but
-        normalising at inference eliminates any residual magnitude variance.
+           With T=3.0:
+             p0 = [0.95, 0.03, 0.02] -> p_soft = [0.72, 0.15, 0.13]
+             Uncertainty: 0.05 -> 0.28 (5.6x more room)
 
-        The velocity_inference_scale parameter controls how much each
-        frame's distribution changes in a single update. Too small and
-        the flow barely modifies p0. Too large and it overshoots past
-        the correct phoneme. The optimal value can be found by sweeping
-        at test time without retraining.
+        2. Multi-pass: instead of one sweep, run num_passes sweeps.
+           Each pass refines the previous output. The velocity net's
+           temporal convolutions see previously-updated frames, enabling
+           iterative refinement. Each frame gets num_passes total updates.
+
+        Confidence weighting uses the SOFTENED distribution's uncertainty,
+        so corrections are naturally larger on uncertain frames.
         """
+        temperature = self.hparams.flow_temperature
+        base_scale = self.hparams.base_scale
+        num_passes = self.hparams.num_passes
         dt = 1.0 / num_steps
-        p = p0.clone()
         B, T_enc = hidden.size(0), hidden.size(1)
-        scale = self.hparams.velocity_inference_scale
 
-        for step in range(num_steps):
-            t = step * dt
+        # ============================================================
+        # Temperature softening: flatten p0 to create uncertainty
+        # p_soft = p0^(1/T) / sum(p0^(1/T))
+        # T=1.0: no change, T>1: flatter, T<1: sharper
+        # ============================================================
+        log_p0 = torch.log(p0.clamp_min(self.hparams.dfm_epsilon))
+        p_soft = torch.softmax(log_p0 / temperature, dim=-1)
 
-            # Frame window for this step
-            frame_start = int(t * T_enc)
-            frame_end = min(int((t + dt) * T_enc), T_enc)
-            frame_start = min(frame_start, T_enc - 1)
-            frame_end = max(frame_end, frame_start + 1)
+        p = p_soft.clone()
 
-            # H_τ: acoustic conditioning at the center of the window
-            tau = min(int((frame_start + frame_end) / 2), T_enc - 1)
-            h_tau = hidden[:, tau:tau+1, :].expand_as(hidden)
+        # Pre-compute uncertainty from softened distribution
+        max_probs = p_soft.max(dim=-1, keepdim=True).values
+        uncertainty = 1.0 - max_probs
 
-            # Run velocity net on ALL frames (temporal convs need context)
-            v = self.modules.velocity_net(p, t, h_tau)
+        # ============================================================
+        # Multi-pass local-window integration
+        # Each pass sweeps through the utterance from left to right.
+        # After pass 1, the updated frames provide new temporal context
+        # for pass 2's velocity predictions via the conv layers.
+        # ============================================================
+        for pass_idx in range(num_passes):
+            for step in range(num_steps):
+                t = step * dt
 
-            # ============================================================
-            # Fix 1+3: Normalise to unit length, then scale by fixed factor
-            # Direction from the learned net, magnitude from the parameter.
-            # This eliminates magnitude overfitting entirely.
-            # ============================================================
-            v_local = v[:, frame_start:frame_end, :]
-            v_norm = torch.sqrt(
-                (v_local ** 2).sum(dim=-1, keepdim=True)
-            ).clamp_min(1e-8)
-            v_local = v_local / v_norm * scale
+                frame_start = int(t * T_enc)
+                frame_end = min(int((t + dt) * T_enc), T_enc)
+                frame_start = min(frame_start, T_enc - 1)
+                frame_end = max(frame_end, frame_start + 1)
 
-            # Apply the scaled update to the local window
-            p[:, frame_start:frame_end, :] = (
-                p[:, frame_start:frame_end, :] + dt * v_local
-            )
+                tau = min(int((frame_start + frame_end) / 2), T_enc - 1)
+                h_tau = hidden[:, tau:tau+1, :].expand_as(hidden)
 
-            # Project updated frames back onto simplex
-            p[:, frame_start:frame_end, :] = p[:, frame_start:frame_end, :].clamp_min(
-                self.hparams.dfm_epsilon
-            )
-            window_sum = p[:, frame_start:frame_end, :].sum(
-                dim=-1, keepdim=True
-            ).clamp_min(self.hparams.dfm_epsilon)
-            p[:, frame_start:frame_end, :] = (
-                p[:, frame_start:frame_end, :] / window_sum
-            )
+                # Velocity net sees current p (updated by previous passes)
+                v = self.modules.velocity_net(p, t, h_tau)
+
+                # Normalise to unit direction, scale by confidence weight
+                v_local = v[:, frame_start:frame_end, :]
+                v_norm = torch.sqrt(
+                    (v_local ** 2).sum(dim=-1, keepdim=True)
+                ).clamp_min(1e-8)
+                v_unit = v_local / v_norm
+
+                local_uncertainty = uncertainty[:, frame_start:frame_end, :]
+                v_scaled = v_unit * base_scale * local_uncertainty
+
+                p[:, frame_start:frame_end, :] = (
+                    p[:, frame_start:frame_end, :] + dt * v_scaled
+                )
+
+                # Project back onto simplex
+                p[:, frame_start:frame_end, :] = (
+                    p[:, frame_start:frame_end, :].clamp_min(
+                        self.hparams.dfm_epsilon
+                    )
+                )
+                window_sum = p[:, frame_start:frame_end, :].sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(self.hparams.dfm_epsilon)
+                p[:, frame_start:frame_end, :] = (
+                    p[:, frame_start:frame_end, :] / window_sum
+                )
 
         return p
 
@@ -457,18 +462,8 @@ class ASR_Brain(sb.Brain):
                     w_prev + frac * (w_k_expanded - w_prev)
                 )
 
-                # Algorithm 3, line 12: target velocity
-                # Raw velocity: (w_k - w_prev) / dt_seg
+                # Algorithm 3, line 12: unit-normalised target velocity
                 raw_vt = (w_k_expanded - w_prev) / dt_seg
-
-                # ============================================================
-                # Fix 3: Normalise target velocity to unit length.
-                # The velocity net only needs to learn DIRECTION, not
-                # magnitude. This eliminates the main source of overfitting:
-                # short phones had huge velocities (~100+ L2) while long
-                # phones had small ones (~20 L2). After normalisation,
-                # all segments have L2 = 1.0 regardless of duration.
-                # ============================================================
                 raw_vt_norm = torch.sqrt(
                     (raw_vt ** 2).sum(dim=-1, keepdim=True)
                 ).clamp_min(1e-8)
@@ -757,17 +752,11 @@ class ASR_Brain(sb.Brain):
             log_probs, phns, pout_lens, phn_lens
         )
 
-        # FM loss on unit-normalised targets (Fix 3)
-        # With normalised targets, vpred and vt both have L2 ≈ 1.0,
-        # so the FM loss is on the order of 0.5-2.0 (vs ~80-100 before).
-        # lambda_fm is set higher accordingly (1.0 instead of 0.02).
+        # FM loss on unit-normalised targets (direction-only training)
         fm_sq = ((vpred - vt) ** 2).mean(dim=-1)
         fm_loss = (fm_sq * frame_mask).sum() / frame_mask.sum().clamp_min(1.0)
 
-        # Fix 2: L2 weight decay on velocity net parameters only.
-        # Penalises large weights that enable memorisation of
-        # training-specific magnitude patterns. Does not affect the
-        # encoder because the FM loss is detached from the encoder.
+        # L2 weight decay on velocity net parameters
         velocity_wd = self.hparams.velocity_weight_decay
         if velocity_wd > 0:
             l2_reg = sum(

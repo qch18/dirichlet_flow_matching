@@ -1,32 +1,26 @@
 # ################################
-# Stage 13: Direction-Magnitude Decoupled Time-Synchronous DFM
+# Stage 17: Temperature-Softened Multi-Pass DFM
 #
-# Three fixes for the velocity magnitude overfitting problem:
+# Training: identical to Stage 13 (unit-normalised direction targets)
 #
-# Fix 1 (inference): Predicted velocities are normalised to unit length
-#   then scaled by velocity_inference_scale. Direction from the learned
-#   net, magnitude from a fixed parameter. No overfitting possible.
+# Inference changes (no retraining needed):
+#   flow_temperature: softens p0 before integration
+#     T=1.0: no change (same as Stage 13)
+#     T=3.0: [0.95,0.03,0.02] -> [0.72,0.15,0.13], 5.6x more uncertainty
+#     Tunable at test time: sweep [1, 2, 3, 4, 5]
 #
-# Fix 2 (architecture): Back to 512 hidden, 0.1 dropout, plus L2 weight
-#   decay on velocity net. Keeps 3 conv layers and GroupNorm from Stage 12.
-#   Less capacity = less memorisation of training-specific patterns.
+#   num_passes: number of full sweeps through the utterance
+#     1 pass = same as Stage 13/15 (each frame gets 1 update)
+#     3 passes = each frame gets 3 updates with iterative refinement
+#     Tunable at test time: sweep [1, 2, 3, 5]
 #
-# Fix 3 (training): Target velocities normalised to unit length. The
-#   velocity net only learns direction, not magnitude. All segments have
-#   L2=1.0 targets regardless of phone duration, eliminating the variance
-#   that caused magnitude overfitting.
-#
-# lambda_fm is 1.0 (was 0.02) because normalised targets give FM loss
-# on the order of 0.5-2.0 instead of 50-100.
-#
-# velocity_inference_scale controls correction magnitude at inference.
-# dt * scale = 0.05 * 30 = 1.5 per frame, which is enough to shift
-# a distribution toward the correct phoneme without overshooting.
-# This can be tuned after training without retraining.
+#   base_scale: correction magnitude multiplier
+#     Scaled by per-frame uncertainty from softened distribution
+#     Tunable at test time: sweep [5, 10, 15, 20, 30, 50]
 # ################################
 
 seed: 1986
-run_name: dfm_stage13_direction_decoupled
+run_name: dfm_stage17_temperature_multipass
 output_folder: !ref results/updated_ctc/<run_name>
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 test_wer_file: !ref <output_folder>/wer_test.txt
@@ -40,7 +34,7 @@ data_folder: "E:/dfm_asr/data/TIMIT/data"
 train_annotation: !ref <save_folder>/train.json
 valid_annotation: !ref <save_folder>/dev.json
 test_annotation: !ref <save_folder>/test.json
-skip_prep: True
+skip_prep: False
 uppercase: True
 
 # ----------------------------------------------------------------------
@@ -92,19 +86,26 @@ dfm_epsilon: 1.0e-6
 target_smoothing: 0.02
 velocity_hidden: 512
 
-# Euler integration steps: S=20 gives ~3 frames per window
+# Euler integration steps per pass
 num_flow_steps: 20
 
-# Fixed magnitude for inference velocity normalisation
-# correction = dt * scale = 0.05 * 30 = 1.5 per frame
-# Tune this AFTER training by sweeping: 10, 15, 20, 25, 30, 40, 50
-velocity_inference_scale: 3
+# Temperature softening: flattens p0 before flow integration
+# T=1.0: no softening. T=3.0: 5.6x more uncertainty on confident frames.
+flow_temperature: 1.5
+
+# Number of full sweeps through utterance
+# Each pass refines the previous pass's output
+num_passes: 1
+
+# Confidence-weighted base scale
+# Correction = dt * base_scale * uncertainty * v_unit
+# With T=3 and base_scale=15:
+#   Uncertain frame (softened max_prob=0.50): 0.05 * 15 * 0.50 = 0.375
+#   Confident frame (softened max_prob=0.80): 0.05 * 15 * 0.20 = 0.150
+base_scale: 10
 
 # ----------------------------------------------------------------------
 # Hybrid loss weights
-# With unit-normalised targets, FM loss is ~0.5-2.0 (not ~80-100).
-# lambda_fm: 1.0 gives comparable gradient contribution to CTC.
-# velocity_weight_decay: L2 penalty on velocity net weights only.
 # ----------------------------------------------------------------------
 lambda_ctc: 1.0
 lambda_fm: 1.0
@@ -207,14 +208,13 @@ model: !new:speechbrain.lobes.models.CRDNN.CRDNN
     dnn_blocks: !ref <dnn_blocks>
     dnn_neurons: !ref <dnn_neurons>
 
-# Linear projection head: H -> Z (logits)
+# Linear projection head
 output: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <dnn_neurons>
     n_neurons: !ref <output_neurons>
     bias: True
 
-# Velocity network: direction-only prediction
-# 512 hidden, 3 conv layers, 0.1 dropout, GroupNorm
+# Velocity network
 velocity_net: !new:__main__.VelocityNet
     vocab_size: !ref <output_neurons>
     hidden_size: !ref <dnn_neurons>
